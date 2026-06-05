@@ -1,6 +1,6 @@
 python openx_rlds.py \
-    --raw-dir /path/to/droid/1.0.0 \
-    --local-dir /path/to/LEROBOT_DATASET \
-    --repo-id your_hf_id \
+    --raw-dir /scratch/cgao304/dev/FastWAM/data/datasets/taco_play/0.1.0 \
+    --local-dir /scratch/cgao304/dev/FastWAM/data/datasets/my_lerobot \
+    --repo_id typoverflow/taco_play \
     --use-videos \
     --push-to-hub

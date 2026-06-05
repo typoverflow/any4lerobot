@@ -41,6 +41,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from oxe_utils.configs import OXE_DATASET_CONFIGS, ActionEncoding, StateEncoding
 from oxe_utils.transforms import OXE_STANDARDIZATION_TRANSFORMS
+from oxe_utils.constants import STATE_NAMES, ACTION_NAMES
 
 np.set_printoptions(precision=2)
 
@@ -51,88 +52,22 @@ def transform_raw_dataset(episode, dataset_name):
     if dataset_name in OXE_STANDARDIZATION_TRANSFORMS:
         traj = OXE_STANDARDIZATION_TRANSFORMS[dataset_name](traj)
 
-    if dataset_name in OXE_DATASET_CONFIGS:
-        state_obs_keys = OXE_DATASET_CONFIGS[dataset_name]["state_obs_keys"]
-    else:
-        state_obs_keys = [None for _ in range(8)]
+    # The standardization transform populates "state" and "action" as dicts of named sub-features
+    # (e.g. state.eef_xyz, action.eef_rpy, ...). Cast every sub-feature to float32 for LeRobot.
+    traj["state"] = {key: tf.cast(value, tf.float32) for key, value in traj["state"].items()}
+    traj["action"] = {key: tf.cast(value, tf.float32) for key, value in traj["action"].items()}
 
-    proprio = tf.concat(
-        [
-            (
-                tf.zeros((tf.shape(traj["action"])[0], 1), dtype=tf.float32)  # padding
-                if key is None
-                else tf.cast(traj["observation"][key], tf.float32)
-            )
-            for key in state_obs_keys
-        ],
-        axis=1,
-    )
-
-    traj.update(
-        {
-            "proprio": proprio,
-            "task": traj.pop("language_instruction"),
-            "action": tf.cast(traj["action"], tf.float32),
-        }
-    )
+    traj["task"] = traj.pop("language_instruction")
 
     episode["steps"] = traj
     return episode
 
 
-def generate_features_from_raw(builder: tfds.core.DatasetBuilder, use_videos: bool = True):
-    dataset_name = Path(builder.data_dir).parent.name
+def generate_features_from_raw(episode, builder: tfds.core.DatasetBuilder, use_videos: bool = True):
 
-    state_names = [f"motor_{i}" for i in range(8)]
-    if dataset_name in OXE_DATASET_CONFIGS:
-        state_encoding = OXE_DATASET_CONFIGS[dataset_name]["state_encoding"]
-        if state_encoding == StateEncoding.POS_EULER:
-            state_names = ["x", "y", "z", "roll", "pitch", "yaw", "pad", "gripper"]
-            if "libero" in dataset_name:
-                state_names = [
-                    "x",
-                    "y",
-                    "z",
-                    "axis_angle1",
-                    "axis_angle2",
-                    "axis_angle3",
-                    "gripper",
-                    "gripper",
-                ]  # 2D gripper state
-        elif state_encoding == StateEncoding.POS_QUAT:
-            state_names = ["x", "y", "z", "rx", "ry", "rz", "rw", "gripper"]
-        elif state_encoding == StateEncoding.JOINT:
-            state_names = [f"motor_{i}" for i in range(7)] + ["gripper"]
-            state_obs_keys = OXE_DATASET_CONFIGS[dataset_name]["state_obs_keys"]
-            pad_count = state_obs_keys[:-1].count(None)
-            state_names[-pad_count - 1 : -1] = ["pad"] * pad_count
-            state_names[-1] = "pad" if state_obs_keys[-1] is None else state_names[-1]
-
-    action_names = [f"motor_{i}" for i in range(8)]
-    if dataset_name in OXE_DATASET_CONFIGS:
-        action_encoding = OXE_DATASET_CONFIGS[dataset_name]["action_encoding"]
-        if action_encoding == ActionEncoding.EEF_POS:
-            action_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-            if "libero" in dataset_name:
-                action_names = ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper"]
-        elif action_encoding == ActionEncoding.JOINT_POS:
-            action_names = [f"motor_{i}" for i in range(7)] + ["gripper"]
-
-    DEFAULT_FEATURES = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": (len(state_names),),
-            "names": {"motors": state_names},
-        },
-        "action": {
-            "dtype": "float32",
-            "shape": (len(action_names),),
-            "names": {"motors": action_names},
-        },
-    }
-
+    # Image specs come from the raw builder info (their shapes are unchanged by the transform).
     obs = builder.info.features["steps"]["observation"]
-    features = {
+    obs_features = {
         f"observation.images.{key}": {
             "dtype": "video" if use_videos else "image",
             "shape": value.shape,
@@ -141,23 +76,54 @@ def generate_features_from_raw(builder: tfds.core.DatasetBuilder, use_videos: bo
         for key, value in obs.items()
         if "depth" not in key and any(x in key for x in ["image", "rgb"])
     }
-    return {**features, **DEFAULT_FEATURES}
+
+    # "state"/"action" are produced by the standardization transform and do not exist on the raw
+    # builder, so derive their specs from one already-transformed episode. Each sub-feature is
+    # batched as (T, D); the per-frame shape is therefore value.shape[1:].
+    steps = episode["steps"]
+    state_features = {
+        f"state.{key}": {
+            "dtype": "float32",
+            "shape": tuple(value.shape[1:]),
+            "names": {"motors": STATE_NAMES[key]},
+        }
+        for key, value in steps["state"].items()
+    }
+    action_features = {
+        f"action.{key}": {
+            "dtype": "float32",
+            "shape": tuple(value.shape[1:]),
+            "names": {"motors": ACTION_NAMES[key]},
+        }
+        for key, value in steps["action"].items()
+    }
+
+    return {**obs_features, **state_features, **action_features}
 
 
 def save_as_lerobot_dataset(lerobot_dataset: LeRobotDataset, raw_dataset: tf.data.Dataset, **kwargs):
     for episode in raw_dataset.as_numpy_iterator():
         traj = episode["steps"]
-        for i in range(traj["action"].shape[0]):
+        num_frames = next(iter(traj["action"].values())).shape[0]
+        for i in range(num_frames):
             image_dict = {
                 f"observation.images.{key}": value[i]
                 for key, value in traj["observation"].items()
                 if "depth" not in key and any(x in key for x in ["image", "rgb"])
             }
+            state_dict = {
+                f"state.{key}": value[i]
+                for key, value in traj["state"].items()
+            }
+            action_dict = {
+                f"action.{key}": value[i]
+                for key, value in traj["action"].items()
+            }
             lerobot_dataset.add_frame(
                 {
                     **image_dict,
-                    "observation.state": traj["proprio"][i],
-                    "action": traj["action"][i],
+                    **state_dict,
+                    **action_dict,
                     "task": traj["task"][0].decode(),
                 },
             )
@@ -193,13 +159,18 @@ def create_lerobot_dataset(
         shutil.rmtree(local_dir)
 
     builder = tfds.builder(dataset_name, data_dir=data_dir, version=version)
-    features = generate_features_from_raw(builder, use_videos)
+    # features = generate_features_from_raw(builder, use_videos)
     filter_fn = lambda e: e["success"] if dataset_name == "kuka" else True
     raw_dataset = (
         builder.as_dataset(split="train")
         .filter(filter_fn)
         .map(partial(transform_raw_dataset, dataset_name=dataset_name))
     )
+
+    # Peek one transformed episode so the feature schema reflects the keys this dataset's transform
+    # actually emits (datasets may produce only a subset of STATE_NAMES / ACTION_NAMES).
+    sample_episode = next(iter(raw_dataset.as_numpy_iterator()))
+    features = generate_features_from_raw(sample_episode, builder, use_videos)
 
     if fps is None:
         if dataset_name in OXE_DATASET_CONFIGS:
