@@ -144,9 +144,8 @@ OXE_DATASET_CONFIGS = {
             "secondary": None,
             "wrist": "depth_gripper",
         },
-        "state_obs_keys": ["state_eef", None, "state_gripper"],
-        "state_encoding": StateEncoding.POS_EULER,
-        "action_encoding": ActionEncoding.EEF_POS,
+        "state_encoding": {"joint_position": 7, "gripper_state": 1},
+        "action_encoding": {"command_eef_xyz": 3, "command_eef_rpy": 3, "pad": 1, "command_gripper_state": 1},
         "control_frequency": 15,
         "robot_type": "Franka",
     },
@@ -679,9 +678,16 @@ OXE_DATASET_CONFIGS = {
             "wrist": "wrist_image_left",
         },
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["EEF_state", None, "gripper_state"],
-        "state_encoding": StateEncoding.POS_EULER,
-        "action_encoding": ActionEncoding.EEF_POS,
+        "state_encoding": {
+            "joint_position": 7, 
+            "gripper_state": 1
+        },
+        "action_encoding": {
+            "command_eef_xyz": 3, 
+            "command_eef_rpy": 3, 
+            "pad": 1, 
+            "command_gripper_state": 1, 
+        }, 
         "control_frequency": 15,
         "robot_type": "Franka",
         "aux_kwargs": {
@@ -802,9 +808,16 @@ OXE_DATASET_CONFIGS = {
     "droid_wipe": {
         "image_obs_keys": {"primary": "exterior_image_2_left", "secondary": None, "wrist": "wrist_image_left"},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["proprio"],
-        "state_encoding": StateEncoding.POS_EULER,
-        "action_encoding": ActionEncoding.EEF_POS,
+        "state_encoding": {
+            "joint_position": 7, 
+            "gripper_state": 1
+        },
+        "action_encoding": {
+            "command_eef_xyz": 3, 
+            "command_eef_rpy": 3, 
+            "pad": 1, 
+            "command_gripper_state": 1, 
+        },
         "control_frequency": 15,
         "robot_type": "Franka",
     },

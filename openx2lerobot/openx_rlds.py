@@ -64,6 +64,7 @@ def transform_raw_dataset(episode, dataset_name):
 
 
 def generate_features_from_raw(episode, builder: tfds.core.DatasetBuilder, use_videos: bool = True):
+    dataset_name = Path(builder.data_dir).parent.name
 
     # Image specs come from the raw builder info (their shapes are unchanged by the transform).
     obs = builder.info.features["steps"]["observation"]
@@ -85,23 +86,49 @@ def generate_features_from_raw(episode, builder: tfds.core.DatasetBuilder, use_v
         f"state.{key}": {
             "dtype": "float32",
             "shape": tuple(value.shape[1:]),
-            "names": {"motors": STATE_NAMES[key]},
+            "names": STATE_NAMES[key],
         }
         for key, value in steps["state"].items()
     }
+    state_encoding = OXE_DATASET_CONFIGS[dataset_name]["state_encoding"]
+    state_names = []
+    for key, value in state_encoding.items():
+        if key == "pad":
+            state_names.extend(["pad"] * value)
+        else:
+            state_names.extend(STATE_NAMES[key])
+    state_features["state"] = {
+        "dtype": "float32", 
+        "shape": (sum(state_encoding.values()),), 
+        "names": state_names, 
+    }
+
     action_features = {
         f"action.{key}": {
             "dtype": "float32",
             "shape": tuple(value.shape[1:]),
-            "names": {"motors": ACTION_NAMES[key]},
+            "names": ACTION_NAMES[key],
         }
         for key, value in steps["action"].items()
+    }
+    action_encoding = OXE_DATASET_CONFIGS[dataset_name]["action_encoding"]
+    action_names = []
+    for key, value in action_encoding.items():
+        if key == "pad":
+            action_names.extend(["pad"] * value)
+        else:
+            action_names.extend(ACTION_NAMES[key])
+    action_features["action"] = {
+        "dtype": "float32", 
+        "shape": (sum(action_encoding.values()),), 
+        "names": action_names, 
     }
 
     return {**obs_features, **state_features, **action_features}
 
 
 def save_as_lerobot_dataset(lerobot_dataset: LeRobotDataset, raw_dataset: tf.data.Dataset, **kwargs):
+    dataset_name = Path(lerobot_dataset.root).parent.name
     for episode in raw_dataset.as_numpy_iterator():
         traj = episode["steps"]
         num_frames = next(iter(traj["action"].values())).shape[0]
@@ -119,11 +146,30 @@ def save_as_lerobot_dataset(lerobot_dataset: LeRobotDataset, raw_dataset: tf.dat
                 f"action.{key}": value[i]
                 for key, value in traj["action"].items()
             }
+            # append the state and action
+            state_vec = []
+            state_encoding = OXE_DATASET_CONFIGS[dataset_name]["state_encoding"]
+            for key, value in state_encoding.items():
+                if key == "pad":
+                    state_vec.append(tf.zeros(value))
+                else:
+                    state_vec.append(traj["state"][key][i])
+            state_vec = tf.concat(state_vec, axis=0)
+            action_vec = []
+            action_encoding = OXE_DATASET_CONFIGS[dataset_name]["action_encoding"]
+            for key, value in action_encoding.items():
+                if key == "pad":
+                    action_vec.append(tf.zeros(value))
+                else:
+                    action_vec.append(traj["action"][key][i])
+            action_vec = tf.concat(action_vec, axis=0)
             lerobot_dataset.add_frame(
                 {
                     **image_dict,
                     **state_dict,
                     **action_dict,
+                    "state": state_vec,
+                    "action": action_vec,
                     "task": traj["task"][0].decode(),
                 },
             )

@@ -253,6 +253,58 @@ def rotation_6d_to_quaternion(d6: tf.Tensor) -> tf.Tensor:
     return matrix_to_quaternion(rotation_6d_to_matrix(d6))
 
 
+# --- relative SE(3) motion -----------------------------------------------------------------------
+def relative_eef_motion(xyz: tf.Tensor, rotation: tf.Tensor, rot_type: str = "euler"):
+    """Per-step forward relative end-effector motion for a trajectory of *world-frame* poses.
+
+    Inputs are absolute end-effector translations ``xyz`` [T, 3] and rotations ``rotation`` (euler
+    "XYZ" angles [T, 3] when ``rot_type="euler"``, or quaternions [T, 4] (x, y, z, w) when
+    ``rot_type="quaternion"``), each a world-frame pose ``T_t = [[R_t, p_t], [0, 1]]``. The returned
+    delta is paired with the observation at step t, mixing two frames by design (see the state/action
+    design doc):
+        rel_xyz   = p_{t+1} - p_t          # literal world-frame translation difference
+        rel_rot6d = 6D(R_t^T @ R_{t+1})    # rotation of dT = T_t^{-1} T_{t+1}, in the body eef frame
+    while ``rel_euler``/``rel_quat`` are literal world-frame differences of the rotation coordinates
+    (not a rotational delta -- euler/quat are differenced componentwise). This co-locates
+    ``observation[t]``/``state[t]``/``action[t]`` in a single LeRobot frame, matching the in-repo
+    ``relabel_bridge_actions`` (``action[t] = state[t+1] - state[t]``) and the RLDS/LeRobot
+    "action at t is executed from obs at t" convention. The last step has no successor, so its delta
+    is zero (zero translation, identity rotation).
+
+    Returns:
+        rel_xyz:   [T, 3] literal world-frame translation difference ``p_{t+1} - p_t``.
+        rel_euler: [T, 3] componentwise euler "XYZ" difference of the input rotations.
+        rel_quat:  [T, 4] componentwise quaternion (x, y, z, w) difference of the input rotations.
+        rel_rot6d: [T, 6] body-frame relative rotation ``R_t^T @ R_{t+1}`` in 6D (Zhou et al. 2019).
+    """
+    if rot_type not in ("euler", "quaternion"):
+        raise ValueError(f"rot_type={rot_type!r} must be 'euler' or 'quaternion'")
+    to_matrix = euler_to_matrix if rot_type == "euler" else quaternion_to_matrix
+
+    xyz = tf.cast(xyz, tf.float32)
+    R = to_matrix(rotation)  # [T, 3, 3]
+    R_curr_T = tf.linalg.matrix_transpose(R[:-1])
+    rel_R = tf.matmul(R_curr_T, R[1:])  # [T-1, 3, 3] body-frame rotation = T_t^{-1} T_{t+1}
+    rel_p = xyz[1:] - xyz[:-1]          # [T-1, 3] literal world-frame translation difference
+    # dT_{T-1} = identity: the last step has no successor.
+    rel_R = tf.concat([rel_R, tf.eye(3, batch_shape=[1])], axis=0)
+    rel_p = tf.concat([rel_p, tf.zeros([1, 3], tf.float32)], axis=0)
+    
+    if rot_type == "euler":
+        diff_euler = rotation[1:] - rotation[:-1]
+        diff_euler = tf.concat([diff_euler, tf.zeros([1, diff_euler.shape[-1]], tf.float32)], axis=0)
+        quat = matrix_to_quaternion(R)
+        diff_quat = quat[1:] - quat[:-1]
+        diff_quat = tf.concat([diff_quat, tf.zeros([1, diff_quat.shape[-1]], tf.float32)], axis=0)
+    else:
+        diff_quat = rotation[1:] - rotation[:-1]
+        diff_quat = tf.concat([diff_quat, tf.zeros([1, diff_quat.shape[-1]], tf.float32)], axis=0)
+        euler = matrix_to_euler(R)
+        diff_euler = euler[1:] - euler[:-1]
+        diff_euler = tf.concat([diff_euler, tf.zeros([1, diff_euler.shape[-1]], tf.float32)], axis=0)
+    return rel_p, diff_euler, diff_quat, matrix_to_rotation_6d(rel_R)
+
+
 # --- generic dispatcher --------------------------------------------------------------------------
 # (from_rep, to_rep) -> conversion fn. Identity conversions return the input unchanged.
 _ROTATION_CONVERTERS = {
