@@ -151,18 +151,18 @@ def save_as_lerobot_dataset(lerobot_dataset: LeRobotDataset, raw_dataset: tf.dat
             state_encoding = OXE_DATASET_CONFIGS[dataset_name]["state_encoding"]
             for key, value in state_encoding.items():
                 if key == "pad":
-                    state_vec.append(tf.zeros(value))
+                    state_vec.append(np.zeros(value, dtype=np.float32))
                 else:
                     state_vec.append(traj["state"][key][i])
-            state_vec = tf.concat(state_vec, axis=0)
+            state_vec = np.concatenate(state_vec, axis=0)
             action_vec = []
             action_encoding = OXE_DATASET_CONFIGS[dataset_name]["action_encoding"]
             for key, value in action_encoding.items():
                 if key == "pad":
-                    action_vec.append(tf.zeros(value))
+                    action_vec.append(np.zeros(value, dtype=np.float32))
                 else:
                     action_vec.append(traj["action"][key][i])
-            action_vec = tf.concat(action_vec, axis=0)
+            action_vec = np.concatenate(action_vec, axis=0)
             lerobot_dataset.add_frame(
                 {
                     **image_dict,
