@@ -244,6 +244,11 @@ def create_lerobot_dataset(
 
     save_as_lerobot_dataset(lerobot_dataset, raw_dataset, keep_images=keep_images)
 
+    # Close the parquet writers so footer metadata is flushed to disk. Without this the last
+    # data/meta parquet files are left without their footer ("PAR1" magic bytes), which makes the
+    # dataset unreadable (e.g. HF viewer: "Parquet magic bytes not found in footer").
+    lerobot_dataset.finalize()
+
     if push_to_hub:
         assert repo_id is not None
         tags = ["LeRobot", dataset_name, "rlds"]
