@@ -282,6 +282,7 @@ def relative_eef_motion(xyz: tf.Tensor, rotation: tf.Tensor, rot_type: str = "eu
     to_matrix = euler_to_matrix if rot_type == "euler" else quaternion_to_matrix
 
     xyz = tf.cast(xyz, tf.float32)
+    rotation = tf.cast(rotation, tf.float32)
     R = to_matrix(rotation)  # [T, 3, 3]
     R_curr_T = tf.linalg.matrix_transpose(R[:-1])
     rel_R = tf.matmul(R_curr_T, R[1:])  # [T-1, 3, 3] body-frame rotation = T_t^{-1} T_{t+1}
