@@ -17,7 +17,6 @@ Per-step state fields:
 |---|---|
 | `eef_xyz` | EEF position `p_t` (3) |
 | `eef_rpy` | EEF orientation as euler "XYZ" (3) |
-<!-- | `eef_rot6d` | EEF orientation as 6D rotation (Zhou et al. 2019) (6). | -->
 | `joint_position` | joint positions |
 | `gripper_state` | gripper open/close |
 
@@ -28,7 +27,7 @@ A reference vector `observation.state` concatenates a per-dataset subset of thes
 Per-step delta paired with the observation at step `t`. 
 
 | field | meaning |
-|---|---|---|
+|---|---|
 | `world_eef_xyz` | `p_{t+1} - p_t` in the world frame |
 | `world_eef_rpy` | `rpy_{t+1} - rpy_t` (componentwise) in the world frame |
 | `world_eef_rot6d` | 6D of `R_{t+1} R_t^T` in the world frame |
