@@ -97,7 +97,7 @@ def generate_features_from_raw(episode, builder: tfds.core.DatasetBuilder, use_v
             state_names.extend(["pad"] * value)
         else:
             state_names.extend(STATE_NAMES[key])
-    state_features["state"] = {
+    state_features["observation.state"] = {
         "dtype": "float32", 
         "shape": (sum(state_encoding.values()),), 
         "names": state_names, 
@@ -168,7 +168,7 @@ def save_as_lerobot_dataset(lerobot_dataset: LeRobotDataset, raw_dataset: tf.dat
                     **image_dict,
                     **state_dict,
                     **action_dict,
-                    "state": state_vec,
+                    "observation.state": state_vec,
                     "action": action_vec,
                     "task": traj["task"][0].decode(),
                 },

@@ -39,6 +39,14 @@ def binarize_gripper_actions(actions: tf.Tensor) -> tf.Tensor:
 
 
 def invert_gripper_actions(actions: tf.Tensor) -> tf.Tensor:
+    """
+    Flips the gripper open/close convention: ``inverted = 1 - actions``.
+
+    The standardized convention in this repo is 1 = fully OPEN, 0 = fully CLOSED. Use this for
+    datasets that store the opposite (0 = open, 1 = closed) -- e.g. DROID's
+    ``gripper_position`` -- so that after inversion 1 means open and 0 means closed.
+    Works on both continuous [0, 1] and binary {0, 1} values.
+    """
     return 1 - actions
 
 
@@ -304,6 +312,74 @@ def relative_eef_motion(xyz: tf.Tensor, rotation: tf.Tensor, rot_type: str = "eu
         diff_euler = euler[1:] - euler[:-1]
         diff_euler = tf.concat([diff_euler, tf.zeros([1, diff_euler.shape[-1]], tf.float32)], axis=0)
     return rel_p, diff_euler, diff_quat, matrix_to_rotation_6d(rel_R)
+
+
+def rpy_to_matrix(rpy: tf.Tensor, extrinsic: bool = False) -> tf.Tensor:
+    """Build rotation matrices [..., 3, 3] from RPY angles [..., 3] = ``(roll, pitch, yaw)``.
+
+    The components are always (roll about X, pitch about Y, yaw about Z); ``extrinsic`` selects only
+    the *composition order*:
+
+      extrinsic=False (default) -- intrinsic XYZ, ``R = Rx(roll) @ Ry(pitch) @ Rz(yaw)``.
+          Matches pytorch3d ``convention="XYZ"`` / DROID's published ``*_rot_6d`` features.
+      extrinsic=True            -- extrinsic (fixed-axis) XYZ, ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
+          The standard robotics RPY used by ROS ``tf``, scipy lowercase ``'xyz'``, pybullet (hence
+          CALVIN / taco_play) and xArm. Equal to intrinsic ZYX evaluated on the reversed angle order.
+
+    Pick the value that matches how the *source* produced its rpy; a mismatch yields a wrong ``R``
+    and therefore wrong relative-rotation / rot6d features (see ``world_body_eef_motion``).
+    """
+    rpy = tf.cast(rpy, tf.float32)
+    if extrinsic:
+        # extrinsic XYZ == intrinsic ZYX on the reversed angle order (yaw, pitch, roll)
+        return euler_to_matrix(rpy[..., ::-1], convention="ZYX")
+    return euler_to_matrix(rpy, convention="XYZ")
+
+
+def world_body_eef_motion(xyz: tf.Tensor, rpy: tf.Tensor, extrinsic: bool = False) -> Dict[str, tf.Tensor]:
+    """Per-step forward relative end-effector motion in BOTH the world and body frames.
+
+    Inputs are absolute *world-frame* poses: translations ``xyz`` [T, 3] and euler RPY angles
+    ``rpy`` [T, 3] = ``(roll, pitch, yaw)``, each ``T_t = [[R_t, p_t], [0, 1]]``. Each returned delta
+    is paired with the observation at step ``t`` ("action at t is executed from obs at t"), per the
+    state/action design doc. The last step has no successor, so its delta is zero translation /
+    identity rotation.
+
+    ``extrinsic`` chooses the euler convention used to rebuild ``R_t`` from ``rpy`` (see
+    ``rpy_to_matrix``): ``False`` = intrinsic XYZ (pytorch3d/DROID, default), ``True`` = extrinsic
+    fixed-axis XYZ (pybullet/CALVIN/ROS/xArm). It MUST match how the source produced its rpy --
+    otherwise ``R_t`` is wrong and the rot6d fields are not faithful rotations (the xyz and
+    componentwise-rpy fields are unaffected, being passed through / differenced directly).
+
+    Returns a dict with:
+        world_eef_xyz:   [T, 3]  ``p_{t+1} - p_t``                  (world frame)
+        world_eef_rpy:   [T, 3]  ``rpy_{t+1} - rpy_t`` componentwise (world frame)
+        world_eef_rot6d: [T, 6]  6D of ``R_{t+1} R_t^T``           (world frame)
+        body_eef_xyz:    [T, 3]  ``R_t^T (p_{t+1} - p_t)``         (body/gripper frame)
+        body_eef_rot6d:  [T, 6]  6D of ``R_t^T R_{t+1}``           (body/gripper frame)
+    """
+    xyz = tf.cast(xyz, tf.float32)
+    rpy = tf.cast(rpy, tf.float32)
+    R = rpy_to_matrix(rpy, extrinsic=extrinsic)  # [T, 3, 3]
+
+    R_curr_T = tf.linalg.matrix_transpose(R[:-1])  # R_t^T, [T-1, 3, 3]
+    dp = xyz[1:] - xyz[:-1]                         # [T-1, 3] world-frame translation delta
+
+    world_rot6d = matrix_to_rotation_6d(tf.matmul(R[1:], R_curr_T))  # 6D of R_{t+1} R_t^T
+    body_rot6d = matrix_to_rotation_6d(tf.matmul(R_curr_T, R[1:]))   # 6D of R_t^T R_{t+1}
+    body_xyz = tf.squeeze(tf.matmul(R_curr_T, dp[..., None]), axis=-1)  # R_t^T (p_{t+1} - p_t)
+    world_rpy = rpy[1:] - rpy[:-1]
+
+    # dT for the last step is identity: it has no successor.
+    eye6 = matrix_to_rotation_6d(tf.eye(3, batch_shape=[1]))  # 6D of identity, [1, 6]
+    zero3 = tf.zeros([1, 3], tf.float32)
+    return {
+        "world_eef_xyz": tf.concat([dp, zero3], axis=0),
+        "world_eef_rpy": tf.concat([world_rpy, zero3], axis=0),
+        "world_eef_rot6d": tf.concat([world_rot6d, eye6], axis=0),
+        "body_eef_xyz": tf.concat([body_xyz, zero3], axis=0),
+        "body_eef_rot6d": tf.concat([body_rot6d, eye6], axis=0),
+    }
 
 
 # --- generic dispatcher --------------------------------------------------------------------------

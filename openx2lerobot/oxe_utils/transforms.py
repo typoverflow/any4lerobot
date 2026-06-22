@@ -21,12 +21,12 @@ from typing import Any, Dict
 import tensorflow as tf
 from oxe_utils.transform_utils import (
     binarize_gripper_actions,
-    euler_to_quaternion,
-    euler_to_rotation_6d,
     invert_gripper_actions,
+    matrix_to_rotation_6d,
     rel2abs_gripper_actions,
     relabel_bridge_actions,
-    relative_eef_motion,
+    rpy_to_matrix,
+    world_body_eef_motion,
 )
 
 
@@ -41,43 +41,38 @@ def droid_baseact_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
         """
         return tf.cond(tf.random.uniform(shape=[]) > 0.5, lambda: (img1, img2), lambda: (img2, img1))
 
-    # --- State ---
-    # eef_xyz: cartesian position of xyz
-    # eef_rpy: cartesian position of euler rpy
-    # eef_quat: euler rpy converted to quaternion
-    # eef_rot6d: euler rpy converted to Rotation 6D representation
+    # --- State (world frame) ---
+    # eef_xyz: eef position
+    # eef_rpy: eef orientation as euler "XYZ"
+    # eef_rot6d: eef orientation as 6D rotation (Zhou et al. 2019)
     # joint_position
-    # gripper state
+    # gripper_state
     trajectory["state"] = {
         "eef_xyz": trajectory["observation"]["cartesian_position"][:, :3],
         "eef_rpy": trajectory["observation"]["cartesian_position"][:, 3:6],
         "joint_position": trajectory["observation"]["joint_position"],
         "gripper_state": invert_gripper_actions(trajectory["observation"]["gripper_position"]),
     }
-    trajectory["state"]["eef_quat"] = euler_to_quaternion(trajectory["state"]["eef_rpy"])
-    trajectory["state"]["eef_rot6d"] = euler_to_rotation_6d(trajectory["state"]["eef_rpy"])
-
-    # --- Action: forward relative (delta) end-effector motion as an SE(3) transform ---
-    # eef_xyz: difference between the state
-    # eef_rpy: difference between the state in euler rpy
-    # eef_quat: difference between the state in quaternion
-    # eef_rot6d: 6D representation of ∆T=T_t⁻¹T_{t+1}
-    # command_eef_xyz: commanded difference of xyz position
-    # command_eef_rpy: commanded difference of euler rpy
-    # command_joint_position: commanded difference of joint positions
-    # command_gripper_state: commanded gripper state
-    rel_xyz, rel_rpy, rel_quat, rel_rot6d = relative_eef_motion(
-        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], rot_type="euler"
+    # DROID's native euler is extrinsic (fixed-axis) XYZ -- its own code decodes poses with
+    # scipy from_euler("xyz") -- so build rotations with extrinsic=True for a faithful rotation.
+    trajectory["state"]["eef_rot6d"] = matrix_to_rotation_6d(
+        rpy_to_matrix(trajectory["state"]["eef_rpy"], extrinsic=True)
     )
+
+    # --- Action: per-step delta paired with obs[t] (see design_of_state_and_action_space.md) ---
+    # world_eef_{xyz,rpy,rot6d}: world-frame deltas
+    # body_eef_{xyz,rot6d}: body(gripper)-frame deltas
+    # joint_position: joint_{t+1} - joint_t
+    # gripper_state: commanded gripper state
+    motion = world_body_eef_motion(
+        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], extrinsic=True
+    )
+    joint = trajectory["state"]["joint_position"]
+    joint_delta = tf.concat([joint[1:] - joint[:-1], tf.zeros_like(joint[:1])], axis=0)
     trajectory["action"] = {
-        "eef_xyz": rel_xyz,
-        "eef_rpy": rel_rpy,
-        "eef_quat": rel_quat, 
-        "eef_rot6d": rel_rot6d,
-        "command_eef_xyz": (trajectory["action_dict"]["cartesian_position"][:, :3] - trajectory["state"]["eef_xyz"]), 
-        "command_eef_rpy": (trajectory["action_dict"]["cartesian_position"][:, 3:6] - trajectory["state"]["eef_rpy"]),
-        "command_joint_position": trajectory["action_dict"]["joint_position"] - trajectory["state"]["joint_position"],
-        "command_gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"]), 
+        **motion,
+        "joint_position": joint_delta,
+        "gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"]),
     }
     trajectory["observation"]["exterior_image_1_left"], trajectory["observation"]["exterior_image_2_left"] = (
         rand_swap_exterior_images(
@@ -92,45 +87,39 @@ def droid_finetuning_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     """
     DROID dataset transformation for actions expressed in *base* frame of the robot.
     """
-    # --- State ---
-    # eef_xyz: cartesian position of xyz
-    # eef_rpy: cartesian position of euler rpy
-    # eef_quat: euler rpy converted to quaternion
-    # eef_rot6d: euler rpy converted to Rotation 6D representation
+    # --- State (world frame) ---
+    # eef_xyz: eef position
+    # eef_rpy: eef orientation as euler "XYZ"
+    # eef_rot6d: eef orientation as 6D rotation (Zhou et al. 2019)
     # joint_position
-    # gripper state
+    # gripper_state
     trajectory["state"] = {
         "eef_xyz": trajectory["observation"]["cartesian_position"][:, :3],
         "eef_rpy": trajectory["observation"]["cartesian_position"][:, 3:6],
         "joint_position": trajectory["observation"]["joint_position"],
         "gripper_state": invert_gripper_actions(trajectory["observation"]["gripper_position"]),
     }
-    trajectory["state"]["eef_quat"] = euler_to_quaternion(trajectory["state"]["eef_rpy"])
-    trajectory["state"]["eef_rot6d"] = euler_to_rotation_6d(trajectory["state"]["eef_rpy"])
-
-    # --- Action: forward relative (delta) end-effector motion as an SE(3) transform ---
-    # eef_xyz: difference between the state
-    # eef_rpy: difference between the state in euler rpy
-    # eef_quat: difference between the state in quaternion
-    # eef_rot6d: 6D representation of ∆T=T_t⁻¹T_{t+1}
-    # command_eef_xyz: commanded difference of xyz position
-    # command_eef_rpy: commanded difference of euler rpy
-    # command_joint_position: commanded difference of joint positions
-    # command_gripper_state: commanded gripper state
-    rel_xyz, rel_rpy, rel_quat, rel_rot6d = relative_eef_motion(
-        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], rot_type="euler"
+    # DROID's native euler is extrinsic (fixed-axis) XYZ -- its own code decodes poses with
+    # scipy from_euler("xyz") -- so build rotations with extrinsic=True for a faithful rotation.
+    trajectory["state"]["eef_rot6d"] = matrix_to_rotation_6d(
+        rpy_to_matrix(trajectory["state"]["eef_rpy"], extrinsic=True)
     )
-    trajectory["action"] = {
-        "eef_xyz": rel_xyz,
-        "eef_rpy": rel_rpy,
-        "eef_quat": rel_quat, 
-        "eef_rot6d": rel_rot6d,
-        "command_eef_xyz": (trajectory["action_dict"]["cartesian_position"][:, :3] - trajectory["state"]["eef_xyz"]), 
-        "command_eef_rpy": (trajectory["action_dict"]["cartesian_position"][:, 3:6] - trajectory["state"]["eef_rpy"]),
-        "command_joint_position": trajectory["action_dict"]["joint_position"] - trajectory["state"]["joint_position"],
-        "command_gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"]), 
-    }
 
+    # --- Action: per-step delta paired with obs[t] (see design_of_state_and_action_space.md) ---
+    # world_eef_{xyz,rpy,rot6d}: world-frame deltas
+    # body_eef_{xyz,rot6d}: body(gripper)-frame deltas
+    # joint_position: joint_{t+1} - joint_t
+    # gripper_state: commanded gripper state
+    motion = world_body_eef_motion(
+        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], extrinsic=True
+    )
+    joint = trajectory["state"]["joint_position"]
+    joint_delta = tf.concat([joint[1:] - joint[:-1], tf.zeros_like(joint[:1])], axis=0)
+    trajectory["action"] = {
+        **motion,
+        "joint_position": joint_delta,
+        "gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"]),
+    }
 
     return trajectory
 
@@ -243,41 +232,38 @@ def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 def taco_play_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
-    # --- State ---
-    # eef_xyz: cartesian position of xyz
-    # eef_rpy: cartesian position of euler rpy
-    # eef_quat: euler rpy converted to quaternion
-    # eef_rot6d: euler rpy converted to Rotation 6D representation
+    # --- State (world frame) ---
+    # eef_xyz: eef position
+    # eef_rpy: eef orientation as euler "XYZ"
+    # eef_rot6d: eef orientation as 6D rotation (Zhou et al. 2019)
     # joint_position
-    # gripper state
+    # gripper_state
     trajectory["state"] = {
         "eef_xyz": trajectory["observation"]["robot_obs"][:, :3],
         "eef_rpy": trajectory["observation"]["robot_obs"][:, 3:6],
         "joint_position": trajectory["observation"]["robot_obs"][:, 7:14],
         "gripper_state": trajectory["observation"]["robot_obs"][:, 6:7],
     }
-    trajectory["state"]["eef_quat"] = euler_to_quaternion(trajectory["state"]["eef_rpy"])
-    trajectory["state"]["eef_rot6d"] = euler_to_rotation_6d(trajectory["state"]["eef_rpy"])
-
-    # --- Action ---
-    # eef_xyz: difference between the state
-    # eef_rpy: difference between the state rpy
-    # eef_quat: difference between the state in quaternion
-    # eef_rot6d: 6D representation of ∆T=T_t⁻¹T_{t+1}
-    # command_eef_xyz: commanded difference of xyz position
-    # command_eef_rpy: commanded difference of euler rpy
-    # command_gripper_state: commanded gripper state
-    rel_xyz, rel_rpy, rel_quat, rel_rot6d = relative_eef_motion(
-        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], rot_type="euler"
+    # CALVIN/taco_play poses come from pybullet, which stores rpy as extrinsic (fixed-axis) XYZ:
+    # R = Rz(yaw) @ Ry(pitch) @ Rx(roll). Build all rotation features with extrinsic=True.
+    trajectory["state"]["eef_rot6d"] = matrix_to_rotation_6d(
+        rpy_to_matrix(trajectory["state"]["eef_rpy"], extrinsic=True)
     )
+
+    # --- Action: per-step delta paired with obs[t] (see design_of_state_and_action_space.md) ---
+    # world_eef_{xyz,rpy,rot6d}: world-frame deltas
+    # body_eef_{xyz,rot6d}: body(gripper)-frame deltas
+    # joint_position: joint_{t+1} - joint_t
+    # gripper_state: commanded gripper state (from rel_actions_world)
+    motion = world_body_eef_motion(
+        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], extrinsic=True
+    )
+    joint = trajectory["state"]["joint_position"]
+    joint_delta = tf.concat([joint[1:] - joint[:-1], tf.zeros_like(joint[:1])], axis=0)
     trajectory["action"] = {
-        "eef_xyz": rel_xyz,
-        "eef_rpy": rel_rpy,
-        "eef_quat": rel_quat, 
-        "eef_rot6d": rel_rot6d,
-        "command_eef_xyz": trajectory["action"]["rel_actions_world"][:, :3], 
-        "command_eef_rpy": trajectory["action"]["rel_actions_world"][:, 3:6], 
-        "command_gripper_state": tf.clip_by_value(trajectory["action"]["rel_actions_world"][:, -1:], 0, 1), 
+        **motion,
+        "joint_position": joint_delta,
+        "gripper_state": tf.clip_by_value(trajectory["action"]["rel_actions_world"][:, -1:], 0, 1),
     }
 
     trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
