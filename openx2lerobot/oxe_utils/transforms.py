@@ -16,18 +16,84 @@ Transforms adopt the following structure:
     }
 """
 
+import os
+import sys
 from typing import Any, Dict
 
 import tensorflow as tf
 from oxe_utils.transform_utils import (
     binarize_gripper_actions,
     invert_gripper_actions,
-    matrix_to_rotation_6d,
     rel2abs_gripper_actions,
     relabel_bridge_actions,
-    rpy_to_matrix,
-    world_body_eef_motion,
 )
+
+# The DROID transforms below use the shared, backend-agnostic frame/rotation math from the
+# alignment package at the repo root (see design_of_state_and_action_space.md). openx runs with
+# CWD=openx2lerobot, so the repo root is not on sys.path by default -- add it before importing.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from alignment import transforms_tf as align_tf  # noqa: E402
+
+
+def _droid_state_and_action(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared DROID state/action builder, implementing design_of_state_and_action_space.md.
+
+    Target e* selection (see the doc's two modes): DROID's raw schema does NOT expose a commanded
+    absolute eef/joint pose -- ``action_dict`` only carries ``gripper_position`` (a commanded
+    gripper target). We therefore fall back to mode 2 and use the *ground-truth next* pose as e*.
+    Per that mode we do NOT pad: the last step has no successor, so it is DISCARDED, leaving every
+    field at length T-1 (action[t] is the motion from obs[t] to obs[t+1]). The gripper action keeps
+    DROID's genuine *commanded* target since it is the one command the dataset does provide.
+
+    Field names follow design_of_state_and_action_space.md. The world/body deltas are the unfolded
+    ``world_body_eef_motion`` written directly with the backend-agnostic ``alignment`` utilities
+    (no padding branch).
+    """
+    obs = trajectory["observation"]
+    eef_xyz = obs["cartesian_position"][:, :3]
+    eef_rpy = obs["cartesian_position"][:, 3:6]
+    joint = obs["joint_position"]
+
+    # DROID's native euler is extrinsic (fixed-axis) XYZ -- its own code decodes poses with
+    # scipy from_euler("xyz") -- so build rotations with extrinsic=True for a faithful rotation.
+    R = align_tf.rpy_to_matrix(eef_rpy, extrinsic=True)  # [T, 3, 3] world-frame orientations
+
+    # --- State (world frame): eef_xyz, eef_rpy, eef_rot6d, joint_pos, gripper_state ---
+    state = {
+        "eef_xyz": eef_xyz,
+        "eef_rpy": eef_rpy,
+        "joint_pos": joint,
+        "gripper_state": invert_gripper_actions(obs["gripper_position"]),
+        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
+    }
+
+    # --- Action: per-step delta from obs[t] (current pose e) to obs[t+1] (target pose e*) ---
+    # world-frame delta: R_{e->e*}^w = R_{t+1} R_t^T, p = p_{t+1} - p_t
+    world_R, world_p = align_tf.world_delta(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    # body-frame delta: R_{e->e*}^e = R_t^T R_{t+1}, p = R_t^T (p_{t+1} - p_t)
+    body_R, body_p = align_tf.relative_pose(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    action = {
+        # literal finite differences (translation only), for completeness
+        "diff_eef_xyz": world_p,
+        "diff_joint_pos": joint[1:] - joint[:-1],
+        # frame-aware eef deltas
+        "world_eef_xyz": world_p,
+        "world_eef_rot6d": align_tf.matrix_to_rotation_6d(world_R),
+        "body_eef_xyz": body_p,
+        "body_eef_rot6d": align_tf.matrix_to_rotation_6d(body_R),
+        # commanded gripper target (the one command DROID provides), inverted to 1=open / 0=closed
+        "gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"])[:-1],
+    }
+
+    # Discard the last step (no padding): drop it from state and observation too so every field is
+    # length T-1 and action[t] stays paired with obs[t].
+    trajectory["state"] = {k: v[:-1] for k, v in state.items()}
+    trajectory["observation"] = {k: v[:-1] for k, v in trajectory["observation"].items()}
+    trajectory["action"] = action
+    return trajectory
 
 
 def droid_baseact_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
@@ -41,87 +107,20 @@ def droid_baseact_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
         """
         return tf.cond(tf.random.uniform(shape=[]) > 0.5, lambda: (img1, img2), lambda: (img2, img1))
 
-    # --- State (world frame) ---
-    # eef_xyz: eef position
-    # eef_rpy: eef orientation as euler "XYZ"
-    # eef_rot6d: eef orientation as 6D rotation (Zhou et al. 2019)
-    # joint_position
-    # gripper_state
-    trajectory["state"] = {
-        "eef_xyz": trajectory["observation"]["cartesian_position"][:, :3],
-        "eef_rpy": trajectory["observation"]["cartesian_position"][:, 3:6],
-        "joint_position": trajectory["observation"]["joint_position"],
-        "gripper_state": invert_gripper_actions(trajectory["observation"]["gripper_position"]),
-    }
-    # DROID's native euler is extrinsic (fixed-axis) XYZ -- its own code decodes poses with
-    # scipy from_euler("xyz") -- so build rotations with extrinsic=True for a faithful rotation.
-    trajectory["state"]["eef_rot6d"] = matrix_to_rotation_6d(
-        rpy_to_matrix(trajectory["state"]["eef_rpy"], extrinsic=True)
-    )
-
-    # --- Action: per-step delta paired with obs[t] (see design_of_state_and_action_space.md) ---
-    # world_eef_{xyz,rpy,rot6d}: world-frame deltas
-    # body_eef_{xyz,rot6d}: body(gripper)-frame deltas
-    # joint_position: joint_{t+1} - joint_t
-    # gripper_state: commanded gripper state
-    motion = world_body_eef_motion(
-        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], extrinsic=True
-    )
-    joint = trajectory["state"]["joint_position"]
-    joint_delta = tf.concat([joint[1:] - joint[:-1], tf.zeros_like(joint[:1])], axis=0)
-    trajectory["action"] = {
-        **motion,
-        "joint_position": joint_delta,
-        "gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"]),
-    }
     trajectory["observation"]["exterior_image_1_left"], trajectory["observation"]["exterior_image_2_left"] = (
         rand_swap_exterior_images(
             trajectory["observation"]["exterior_image_1_left"],
             trajectory["observation"]["exterior_image_2_left"],
         )
     )
-    return trajectory
+    return _droid_state_and_action(trajectory)
 
 
 def droid_finetuning_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     """
     DROID dataset transformation for actions expressed in *base* frame of the robot.
     """
-    # --- State (world frame) ---
-    # eef_xyz: eef position
-    # eef_rpy: eef orientation as euler "XYZ"
-    # eef_rot6d: eef orientation as 6D rotation (Zhou et al. 2019)
-    # joint_position
-    # gripper_state
-    trajectory["state"] = {
-        "eef_xyz": trajectory["observation"]["cartesian_position"][:, :3],
-        "eef_rpy": trajectory["observation"]["cartesian_position"][:, 3:6],
-        "joint_position": trajectory["observation"]["joint_position"],
-        "gripper_state": invert_gripper_actions(trajectory["observation"]["gripper_position"]),
-    }
-    # DROID's native euler is extrinsic (fixed-axis) XYZ -- its own code decodes poses with
-    # scipy from_euler("xyz") -- so build rotations with extrinsic=True for a faithful rotation.
-    trajectory["state"]["eef_rot6d"] = matrix_to_rotation_6d(
-        rpy_to_matrix(trajectory["state"]["eef_rpy"], extrinsic=True)
-    )
-
-    # --- Action: per-step delta paired with obs[t] (see design_of_state_and_action_space.md) ---
-    # world_eef_{xyz,rpy,rot6d}: world-frame deltas
-    # body_eef_{xyz,rot6d}: body(gripper)-frame deltas
-    # joint_position: joint_{t+1} - joint_t
-    # gripper_state: commanded gripper state
-    motion = world_body_eef_motion(
-        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], extrinsic=True
-    )
-    joint = trajectory["state"]["joint_position"]
-    joint_delta = tf.concat([joint[1:] - joint[:-1], tf.zeros_like(joint[:1])], axis=0)
-    trajectory["action"] = {
-        **motion,
-        "joint_position": joint_delta,
-        "gripper_state": invert_gripper_actions(trajectory["action_dict"]["gripper_position"]),
-    }
-
-    return trajectory
+    return _droid_state_and_action(trajectory)
 
 
 def bridge_oxe_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
@@ -155,31 +154,63 @@ def bridge_oxe_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def bridge_orig_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    """Original BridgeData V2 (project website), standardized per design_of_state_and_action_space.md.
+
+    Raw schema: observation.state [7] = eef xyz + extrinsic-XYZ rpy + gripper (1=open); action [7] =
+    commanded delta + gripper. There are NO camera extrinsics in this dataset.
+
+    Target e* selection (the doc's two modes): BridgeData V2's stored ``action`` is a *command* that
+    does not match the achieved state difference, and the repo's canonical ``relabel_bridge_actions``
+    already replaces it with the achieved-state finite difference. We follow that and use mode 2 --
+    the ground-truth *next* pose as e*. Per mode 2 we do NOT pad: the last step has no successor, so it
+    is DISCARDED (every field length T-1, action[t] = motion from obs[t] to obs[t+1]). The gripper
+    action keeps the dataset's commanded gripper (binarized); state/action gripper are already
+    1=open / 0=closed, so no inversion is applied.
+
+    Output schema matches the fractal transform (state {eef_xyz, eef_rpy, eef_rot6d, gripper_state};
+    world/body/diff eef action), differing only in mode (ground-truth next vs command).
     """
-    Applies to original version of Bridge V2 from the official project website.
+    obs = trajectory["observation"]
+    eef_xyz = obs["state"][:, :3]
+    eef_rpy = obs["state"][:, 3:6]
 
-    Note =>> In original Bridge V2 dataset, the first timestep has an all-zero action, so we remove it!
-    """
+    # Bridge's native euler is extrinsic (fixed-axis) XYZ -- verified to match scipy 'xyz' (~1e-7)
+    # and clearly reject intrinsic 'XYZ'. Build rotations with extrinsic=True for a faithful R.
+    R = align_tf.rpy_to_matrix(eef_rpy, extrinsic=True)  # [T, 3, 3] world-frame orientations
 
-    for key in trajectory.keys():
-        if key == "traj_metadata":
-            continue
-        elif key == "observation":
-            for key2 in trajectory[key]:
-                trajectory[key][key2] = trajectory[key][key2][1:]
-        else:
-            trajectory[key] = trajectory[key][1:]
+    # --- State (world frame): eef_xyz, eef_rpy, eef_rot6d, gripper_state (already 1=open) ---
+    state = {
+        "eef_xyz": eef_xyz,
+        "eef_rpy": eef_rpy,
+        "gripper_state": obs["state"][:, 6:7],
+        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
+    }
 
-    trajectory["action"] = tf.concat(
-        [
-            trajectory["action"][:, :6],
-            binarize_gripper_actions(trajectory["action"][:, -1])[:, None],
-        ],
-        axis=1,
-    )
-    trajectory = relabel_bridge_actions(trajectory)
-    trajectory["observation"]["EEF_state"] = trajectory["observation"]["state"][:, :6]
-    trajectory["observation"]["gripper_state"] = trajectory["observation"]["state"][:, -1:]
+    # --- Action: per-step delta from obs[t] (current pose e) to obs[t+1] (target pose e*) ---
+    # world-frame delta: R_{e->e*}^w = R_{t+1} R_t^T, p = p_{t+1} - p_t
+    world_R, world_p = align_tf.world_delta(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    # body-frame delta: R_{e->e*}^e = R_t^T R_{t+1}, p = R_t^T (p_{t+1} - p_t)
+    body_R, body_p = align_tf.relative_pose(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    action = {
+        # literal finite differences (translation / euler), for completeness
+        "diff_eef_xyz": world_p,
+        "diff_eef_rpy": eef_rpy[1:] - eef_rpy[:-1],
+        # frame-aware eef deltas
+        "world_eef_xyz": world_p,
+        "world_eef_rot6d": align_tf.matrix_to_rotation_6d(world_R),
+        "body_eef_xyz": body_p,
+        "body_eef_rot6d": align_tf.matrix_to_rotation_6d(body_R),
+        # commanded gripper target, binarized; already 1=open / 0=closed (no inversion)
+        "gripper_state": binarize_gripper_actions(trajectory["action"][:, 6])[:-1, None],
+    }
+
+    # Discard the last step (no padding): drop it from state and observation too so every field is
+    # length T-1 and action[t] stays paired with obs[t].
+    trajectory["state"] = {k: v[:-1] for k, v in state.items()}
+    trajectory["observation"] = {k: v[:-1] for k, v in trajectory["observation"].items()}
+    trajectory["action"] = action
+    # BridgeData V2 carries the instruction at step level (not under observation); truncate to match.
+    trajectory["language_instruction"] = trajectory["language_instruction"][:-1]
     return trajectory
 
 
@@ -197,19 +228,54 @@ def ppgm_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def rt1_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    # make gripper action absolute action, +1 = open, 0 = close
-    gripper_action = trajectory["action"]["gripper_closedness_action"][:, 0]
-    gripper_action = rel2abs_gripper_actions(gripper_action)
+    """RT-1 / fractal20220817_data, standardized per design_of_state_and_action_space.md.
 
-    trajectory["action"] = tf.concat(
-        (
-            trajectory["action"]["world_vector"],
-            trajectory["action"]["rotation_delta"],
-            gripper_action[:, None],
-        ),
-        axis=-1,
-    )
-    trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
+    Google Robot, base(world)-frame EEF control, no joint sensing. The raw schema has NO camera
+    extrinsics. ``base_pose_tool_reached`` is the achieved EEF pose as xyz + quaternion in
+    (x, y, z, w) order (verified against the data). Unlike DROID, fractal ships genuine commands, so
+    we use the doc's mode 1: the target e* is the commanded next pose, recovered from the raw action
+    ``world_vector`` (commanded translation) + ``rotation_delta`` (commanded rpy rotation) -- both in
+    the base/world frame (verified: world-frame R_{t+1} R_t^T matches rotation_delta). Every step
+    carries a command, so nothing is discarded.
+    """
+    obs = trajectory["observation"]
+    eef_xyz = obs["base_pose_tool_reached"][:, :3]
+    eef_quat = obs["base_pose_tool_reached"][:, 3:7]  # (x, y, z, w)
+    R = align_tf.quaternion_to_matrix(eef_quat)  # [T, 3, 3] world-frame orientations
+    # store orientation as extrinsic-XYZ rpy (consistent with eef_rot6d and the rest of the repo)
+    eef_rpy = align_tf.matrix_to_rpy(R, extrinsic=True)
+
+    # --- State (world frame): eef_xyz, eef_rpy, eef_rot6d, gripper_state (no joints on this robot) ---
+    state = {
+        "eef_xyz": eef_xyz,
+        "eef_rpy": eef_rpy,
+        "gripper_state": invert_gripper_actions(obs["gripper_closed"]),
+        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
+    }
+
+    # --- Action (mode 1, commanded next pose e*): world delta is the raw command ---
+    #   p_{e*} = p_e + world_vector ; R_{e*} = dR_world @ R_e  (world-frame delta, left-multiply)
+    act = trajectory["action"]
+    dR_world = align_tf.rpy_to_matrix(act["rotation_delta"], extrinsic=True)
+    p_estar = eef_xyz + act["world_vector"]
+    R_estar = tf.matmul(dR_world, R)
+    world_R, world_p = align_tf.world_delta(R, eef_xyz, R_estar, p_estar)  # -> (dR_world, world_vector)
+    body_R, body_p = align_tf.relative_pose(R, eef_xyz, R_estar, p_estar)
+    # literal componentwise rpy difference between the target and current orientation
+    diff_eef_rpy = align_tf.matrix_to_rpy(R_estar, extrinsic=True) - eef_rpy
+    # gripper: relative closedness command -> absolute (0=closed, 1=open), repo convention
+    gripper_cmd = rel2abs_gripper_actions(act["gripper_closedness_action"][:, 0])[:, None]
+    trajectory["action"] = {
+        "diff_eef_xyz": world_p,  # literal world-frame translation (= world_eef_xyz under mode 1)
+        "diff_eef_rpy": diff_eef_rpy,
+        "world_eef_xyz": world_p,
+        "world_eef_rot6d": align_tf.matrix_to_rotation_6d(world_R),
+        "body_eef_xyz": body_p,
+        "body_eef_rot6d": align_tf.matrix_to_rotation_6d(body_R),
+        "gripper_state": gripper_cmd,
+    }
+    trajectory["state"] = state
+    trajectory["language_instruction"] = obs["natural_language_instruction"]
     return trajectory
 
 
@@ -231,42 +297,65 @@ def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def taco_play_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    """CALVIN / taco_play (Franka), standardized per design_of_state_and_action_space.md.
 
-    # --- State (world frame) ---
-    # eef_xyz: eef position
-    # eef_rpy: eef orientation as euler "XYZ"
-    # eef_rot6d: eef orientation as 6D rotation (Zhou et al. 2019)
-    # joint_position
-    # gripper_state
-    trajectory["state"] = {
-        "eef_xyz": trajectory["observation"]["robot_obs"][:, :3],
-        "eef_rpy": trajectory["observation"]["robot_obs"][:, 3:6],
-        "joint_position": trajectory["observation"]["robot_obs"][:, 7:14],
-        "gripper_state": trajectory["observation"]["robot_obs"][:, 6:7],
+    Raw schema: ``observation.robot_obs`` [15] = eef xyz (0:3) + eef rpy (3:6) + gripper width (6) +
+    joint positions (7:14) + gripper action (14). Poses come from pybullet, whose euler is extrinsic
+    (fixed-axis) XYZ. There are NO camera extrinsics.
+
+    Target e* selection (the doc's two modes): taco_play ships an absolute pose command
+    (``action.actions`` [0:6], in meters/radians) that differs materially from the achieved motion
+    (~0.03 m commanded gap vs ~0.0035 m achieved per step), so a real command exists. But its joints
+    have NO joint command, and the relative actions (``rel_actions_world`` / ``rel_actions_gripper``)
+    are CALVIN's *scaled + clipped* normalized actions (~[-1, 1], ~40x the physical displacement),
+    not usable as geometry. For a uniform, well-defined eef *and* joint delta we follow DROID and use
+    mode 2 -- the ground-truth *next* pose as e*. Per mode 2 we do NOT pad: the last step has no
+    successor, so it is DISCARDED (every field length T-1, action[t] = motion obs[t]->obs[t+1]). The
+    gripper action keeps the dataset's commanded gripper (``action.actions[:, 6]``, 1=open / -1=closed
+    -> clipped to 1=open / 0=closed).
+    """
+    obs = trajectory["observation"]
+    robot_obs = obs["robot_obs"]
+    eef_xyz = robot_obs[:, 0:3]
+    eef_rpy = robot_obs[:, 3:6]
+    joint = robot_obs[:, 7:14]
+    lang = obs["natural_language_instruction"]
+
+    # CALVIN/taco_play poses come from pybullet -> extrinsic (fixed-axis) XYZ euler.
+    R = align_tf.rpy_to_matrix(eef_rpy, extrinsic=True)  # [T, 3, 3] world-frame orientations
+
+    # --- State (world frame): eef_xyz, eef_rpy, eef_rot6d, joint_pos, gripper_state (gripper width) ---
+    state = {
+        "eef_xyz": eef_xyz,
+        "eef_rpy": eef_rpy,
+        "joint_pos": joint,
+        "gripper_state": robot_obs[:, 6:7],  # sensed gripper width; larger = more open
+        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
     }
-    # CALVIN/taco_play poses come from pybullet, which stores rpy as extrinsic (fixed-axis) XYZ:
-    # R = Rz(yaw) @ Ry(pitch) @ Rx(roll). Build all rotation features with extrinsic=True.
-    trajectory["state"]["eef_rot6d"] = matrix_to_rotation_6d(
-        rpy_to_matrix(trajectory["state"]["eef_rpy"], extrinsic=True)
-    )
 
-    # --- Action: per-step delta paired with obs[t] (see design_of_state_and_action_space.md) ---
-    # world_eef_{xyz,rpy,rot6d}: world-frame deltas
-    # body_eef_{xyz,rot6d}: body(gripper)-frame deltas
-    # joint_position: joint_{t+1} - joint_t
-    # gripper_state: commanded gripper state (from rel_actions_world)
-    motion = world_body_eef_motion(
-        trajectory["state"]["eef_xyz"], trajectory["state"]["eef_rpy"], extrinsic=True
-    )
-    joint = trajectory["state"]["joint_position"]
-    joint_delta = tf.concat([joint[1:] - joint[:-1], tf.zeros_like(joint[:1])], axis=0)
-    trajectory["action"] = {
-        **motion,
-        "joint_position": joint_delta,
-        "gripper_state": tf.clip_by_value(trajectory["action"]["rel_actions_world"][:, -1:], 0, 1),
+    # --- Action: per-step delta from obs[t] (current pose e) to obs[t+1] (target pose e*) ---
+    world_R, world_p = align_tf.world_delta(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    body_R, body_p = align_tf.relative_pose(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    action = {
+        # literal finite differences (translation / euler / joints), for completeness
+        "diff_eef_xyz": world_p,
+        "diff_eef_rpy": eef_rpy[1:] - eef_rpy[:-1],
+        "diff_joint_pos": joint[1:] - joint[:-1],
+        # frame-aware eef deltas
+        "world_eef_xyz": world_p,
+        "world_eef_rot6d": align_tf.matrix_to_rotation_6d(world_R),
+        "body_eef_xyz": body_p,
+        "body_eef_rot6d": align_tf.matrix_to_rotation_6d(body_R),
+        # commanded gripper target (absolute action), 1=open / -1=closed -> clip to 1=open / 0=closed
+        "gripper_state": tf.clip_by_value(trajectory["action"]["actions"][:-1, 6:7], 0.0, 1.0),
     }
 
-    trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
+    # Discard the last step (no padding): drop it from state and observation too so every field is
+    # length T-1 and action[t] stays paired with obs[t].
+    trajectory["state"] = {k: v[:-1] for k, v in state.items()}
+    trajectory["observation"] = {k: v[:-1] for k, v in trajectory["observation"].items()}
+    trajectory["action"] = action
+    trajectory["language_instruction"] = lang[:-1]
     return trajectory
 
 
@@ -611,15 +700,63 @@ def austin_sirius_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any
 
 
 def bc_z_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    trajectory["action"] = tf.concat(
-        (
-            trajectory["action"]["future/xyz_residual"][:, :3],
-            trajectory["action"]["future/axis_angle_residual"][:, :3],
-            invert_gripper_actions(tf.cast(trajectory["action"]["future/target_close"][:, :1], tf.float32)),
-        ),
-        axis=-1,
-    )
-    trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
+    """BC-Z, standardized per design_of_state_and_action_space.md.
+
+    Google Robot, base(world)-frame EEF control, no joint sensing. The raw schema has NO camera
+    extrinsics. The current EEF orientation ``present/axis_angle`` is an axis-angle (rotation vector)
+    in the robot/base frame; ``present/xyz`` is the base-frame position.
+
+    Target e* selection (the doc's two modes): although BC-Z exposes ``future/{xyz,axis_angle}_residual``
+    (10 "future actions", each an additive delta to the current pose), the first block is NOT a
+    single-step command -- empirically ``future/xyz_residual[:3]`` best matches the achieved
+    displacement ~5-7 steps ahead (~0.033 m vs ~0.0035 m achieved per step, ~9x), i.e. it is a
+    far-horizon target. Using it as the per-step e* would inflate every action ~9x and break
+    state-action consistency. So we use mode 2 -- the ground-truth *next* pose as e* -- like DROID and
+    bridge. Per mode 2 we do NOT pad: the last step has no successor, so it is DISCARDED (every field
+    length T-1, action[t] = motion obs[t]->obs[t+1]). The gripper action keeps BC-Z's commanded
+    immediate gripper target (``future/target_close[:, 0]``), which is a genuine 1-step binary command.
+    """
+    obs = trajectory["observation"]
+    eef_xyz = obs["present/xyz"]  # [T, 3] base-frame position
+    eef_aa = obs["present/axis_angle"]  # [T, 3] axis-angle (rotation vector)
+    R = align_tf.axis_angle_to_matrix(eef_aa)  # [T, 3, 3] world-frame orientations
+    # store orientation as extrinsic-XYZ rpy (consistent with eef_rot6d and the rest of the repo)
+    eef_rpy = align_tf.matrix_to_rpy(R, extrinsic=True)
+    lang = obs["natural_language_instruction"]
+
+    # --- State (world frame): eef_xyz, eef_rpy, eef_rot6d, gripper_state (no joints on this robot) ---
+    # present/sensed_close is continuous in [~0.2, 1] with 1 = fully closed -> invert to 1=open.
+    state = {
+        "eef_xyz": eef_xyz,
+        "eef_rpy": eef_rpy,
+        "gripper_state": invert_gripper_actions(obs["present/sensed_close"]),
+        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
+    }
+
+    # --- Action: per-step delta from obs[t] (current pose e) to obs[t+1] (target pose e*) ---
+    # world-frame delta: R_{e->e*}^w = R_{t+1} R_t^T, p = p_{t+1} - p_t
+    world_R, world_p = align_tf.world_delta(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    # body-frame delta: R_{e->e*}^e = R_t^T R_{t+1}, p = R_t^T (p_{t+1} - p_t)
+    body_R, body_p = align_tf.relative_pose(R[:-1], eef_xyz[:-1], R[1:], eef_xyz[1:])
+    action = {
+        # literal finite differences (translation / euler), for completeness
+        "diff_eef_xyz": world_p,
+        "diff_eef_rpy": eef_rpy[1:] - eef_rpy[:-1],
+        # frame-aware eef deltas
+        "world_eef_xyz": world_p,
+        "world_eef_rot6d": align_tf.matrix_to_rotation_6d(world_R),
+        "body_eef_xyz": body_p,
+        "body_eef_rot6d": align_tf.matrix_to_rotation_6d(body_R),
+        # commanded immediate gripper target, binary {0,1} with 1=closed -> invert to 1=open; discard last
+        "gripper_state": invert_gripper_actions(tf.cast(trajectory["action"]["future/target_close"][:-1, :1], tf.float32)),
+    }
+
+    # Discard the last step (no padding): drop it from state and observation too so every field is
+    # length T-1 and action[t] stays paired with obs[t].
+    trajectory["state"] = {k: v[:-1] for k, v in state.items()}
+    trajectory["observation"] = {k: v[:-1] for k, v in trajectory["observation"].items()}
+    trajectory["action"] = action
+    trajectory["language_instruction"] = lang[:-1]
     return trajectory
 
 
