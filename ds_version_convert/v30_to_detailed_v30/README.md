@@ -18,13 +18,13 @@ but **without** going through RLDS/TF or re-encoding any video:
   is produced by aggregating them with lerobot's `aggregate_feature_stats` (video and
   index-column stats are carried over from the source).
 
-Output reference vectors (per `OXE_DATASET_CONFIGS["droid"]`; single-arm -> **body-frame** actions):
+Output reference vectors (per `OXE_DATASET_CONFIGS["droid"]`; single-arm -> **gripper-frame** actions):
 
 - `observation.state` (20) = `[eef_xyz (3), eef_rpy (3), eef_rot6d (6), joint_position (7), gripper_state (1)]`
-- `action` (10) = `[body_eef_xyz (3), body_eef_rot6d (6), gripper_state (1)]`
+- `action` (10) = `[gripper_eef_xyz (3), gripper_eef_rot6d (6), gripper_state (1)]`
 
 Per-frame `action.*` also includes the world-frame variants (`world_eef_xyz`, `world_eef_rpy`,
-`world_eef_rot6d`), the body-frame fields, the realized `joint_position` delta, and `gripper_state`.
+`world_eef_rot6d`), the gripper-frame fields, the realized `joint_position` delta, and `gripper_state`.
 
 Gripper convention: DROID stores `gripper_position` as 0 = fully open / 1 = fully closed;
 `state.gripper_state` and `action.gripper_state` are the inverted values

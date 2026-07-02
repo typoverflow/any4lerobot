@@ -238,11 +238,76 @@ def convert_rotation(rotation: torch.Tensor, from_rep: str, to_rep: str) -> torc
     return from_matrix(to_matrix(rotation, from_rep), to_rep)
 
 
-# === SE(3) frame math (see design_of_state_and_action_space.md) ==================================
-def relative_pose(R_cur: torch.Tensor, p_cur: torch.Tensor, R_tgt: torch.Tensor, p_tgt: torch.Tensor):
-    """Body-frame delta from current pose e to target pose e* (the stored representation).
+# === Axis-orientation alignment (native frames -> canonical; see design doc: Preprocessing) =======
+_AXIS_VECTORS = {
+    "x": (1.0, 0.0, 0.0), "-x": (-1.0, 0.0, 0.0),
+    "y": (0.0, 1.0, 0.0), "-y": (0.0, -1.0, 0.0),
+    "z": (0.0, 0.0, 1.0), "-z": (0.0, 0.0, -1.0),
+}
 
-    Returns (R_delta_body, p_delta_body), i.e. the rotation/translation of the relative
+
+def _axis_alignment_rows(x_to: str, y_to: str, z_to: str):
+    """Validate a signed-axis spec and return the alignment matrix as row-major python lists.
+
+    Each of ``x_to``/``y_to``/``z_to`` names where the SOURCE (native) x/y/z axis points in the
+    DESTINATION (canonical) frame -- one of 'x','-x','y','-y','z','-z'. Those three unit vectors are
+    the COLUMNS of the returned matrix, so ``v^dst = R v^src``. Raises unless the spec is a proper
+    rotation (a signed permutation of x,y,z with det = +1; det = -1 is a reflection / mixed handedness).
+    """
+    spec = (x_to, y_to, z_to)
+    for a in spec:
+        if a not in _AXIS_VECTORS:
+            raise ValueError(f"axis {a!r} must be one of {sorted(_AXIS_VECTORS)}")
+    if sorted(a.lstrip("-") for a in spec) != ["x", "y", "z"]:
+        raise ValueError(f"axes {spec} are not orthonormal: each of x, y, z must appear exactly once")
+    cols = [_AXIS_VECTORS[a] for a in spec]
+    rows = [[cols[k][r] for k in range(3)] for r in range(3)]  # row-major; columns = source axes
+    (m00, m01, m02), (m10, m11, m12), (m20, m21, m22) = rows
+    det = (m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20)
+           + m02 * (m10 * m21 - m11 * m20))
+    if abs(det - 1.0) > 1e-6:
+        raise ValueError(f"axes {spec} give det={det:+.0f}; need a proper rotation (+1). "
+                         "det = -1 is a reflection (mixed handedness) -- flip one axis.")
+    return rows
+
+
+def axis_alignment_matrix(x_to: str, y_to: str, z_to: str) -> torch.Tensor:
+    """Constant rotation ``R_{src->dst}`` mapping a frame's axes onto a target convention.
+
+    Build once per dataset to bring the native world frame to canonical FLU (x-fwd, y-left, z-up) and,
+    if the gripper axes differ, the native gripper frame to canonical OpenCV (z-fwd, x-right, y-down);
+    feed the result(s) to ``align_axis``. Args: see ``_axis_alignment_rows``.
+
+    Example -- native Forward-Right-Down world -> canonical Forward-Left-Up:
+        axis_alignment_matrix("x", "-y", "-z")  # -> diag(1, -1, -1)
+    """
+    return _f32(_axis_alignment_rows(x_to, y_to, z_to))
+
+
+def align_axis(R, p, R_world_align, R_gripper_align=None):
+    """Map native-frame poses into the canonical frames (design doc: Preprocessing -> Axis alignment).
+
+    Applies the constant alignment rotations R_{w'}^w (world) and, optionally, R_{e'}^e (gripper):
+        p^w   = R_{w'}^w p^{w'}
+        R_e^w = R_{w'}^w R_{e'}^{w'} (R_{e'}^e)^T
+    ``R_world_align`` = R_{w'}^w and ``R_gripper_align`` = R_{e'}^e come from ``axis_alignment_matrix``
+    (pass ``R_gripper_align=None`` when the gripper axes are already canonical, i.e. only re-base the
+    world). Inputs are native world-frame poses R [..., 3, 3], p [..., 3]; returns the aligned (R, p).
+    Joint angles are frame-independent and need no alignment.
+    """
+    Rw = _f32(R_world_align)
+    R_aligned = torch.matmul(Rw, _f32(R))
+    if R_gripper_align is not None:
+        R_aligned = torch.matmul(R_aligned, _f32(R_gripper_align).transpose(-1, -2))
+    p_aligned = _matvec(Rw, _f32(p))
+    return R_aligned, p_aligned
+
+
+# === SE(3) frame math (see design_of_state_and_action_space.md) ==================================
+def gripper_delta_pose(R_cur: torch.Tensor, p_cur: torch.Tensor, R_tgt: torch.Tensor, p_tgt: torch.Tensor):
+    """Gripper-frame delta from current pose e to target pose e* (the stored representation).
+
+    Returns (R_delta_gripper, p_delta_gripper), i.e. the rotation/translation of the relative
     transform T_{e*}^e = (T_e^w)^{-1} T_{e*}^w:
         R_{e->e*}^e = (R_e^w)^T R_{e*}^w
         p_{e->e*}^e = (R_e^w)^T (p_{e*}^w - p_e^w)
@@ -255,7 +320,7 @@ def relative_pose(R_cur: torch.Tensor, p_cur: torch.Tensor, R_tgt: torch.Tensor,
     return R_delta, p_delta
 
 
-def world_delta(R_cur: torch.Tensor, p_cur: torch.Tensor, R_tgt: torch.Tensor, p_tgt: torch.Tensor):
+def world_delta_pose(R_cur: torch.Tensor, p_cur: torch.Tensor, R_tgt: torch.Tensor, p_tgt: torch.Tensor):
     """World-frame delta from current pose e to target pose e*.
 
     Returns (R_delta_world, p_delta_world):
@@ -268,13 +333,13 @@ def world_delta(R_cur: torch.Tensor, p_cur: torch.Tensor, R_tgt: torch.Tensor, p
     return R_delta, p_delta
 
 
-def change_delta_frame(R_delta: torch.Tensor, p_delta: torch.Tensor, R_src_to_dst: torch.Tensor):
+def change_delta_pose_frame(R_delta: torch.Tensor, p_delta: torch.Tensor, R_src_to_dst: torch.Tensor):
     """Re-express a delta (rotation + translation) from frame ``src`` into frame ``dst``.
 
     ``R_src_to_dst`` = R_src^dst. Applies the conjugation / rotation rules from the doc:
         R_delta^dst = R_src^dst R_delta^src (R_src^dst)^T
         p_delta^dst = R_src^dst p_delta^src
-    With src=e, dst=c this is exactly the load-time body->frame-c conversion.
+    With src=e, dst=c this is exactly the load-time gripper->frame-c conversion.
     """
     Rsd = _f32(R_src_to_dst)
     R_out = torch.matmul(torch.matmul(Rsd, _f32(R_delta)), Rsd.transpose(-1, -2))
@@ -289,20 +354,20 @@ def world_pose_from_model_delta(R_delta_c, p_delta_c, R_e_w, p_e_w, R_c_w):
     The model emits a delta in frame c: (R_{e->e*}^c, p_{e->e*}^c). Given the current
     EEF pose (R_e^w, p_e^w) and the orientation of frame c in world R_c^w, returns the
     absolute target (R_{e*}^w, p_{e*}^w). For a model trained in the world frame pass
-    R_c_w = I; for one trained in the body frame pass R_c_w = R_e^w.
+    R_c_w = I; for one trained in the gripper frame pass R_c_w = R_e^w.
     """
-    R_delta_w, p_delta_w = change_delta_frame(R_delta_c, p_delta_c, R_c_w)  # src=c -> dst=w
+    R_delta_w, p_delta_w = change_delta_pose_frame(R_delta_c, p_delta_c, R_c_w)  # src=c -> dst=w
     R_tgt = torch.matmul(R_delta_w, _f32(R_e_w))
     p_tgt = _f32(p_e_w) + p_delta_w
     return R_tgt, p_tgt
 
 
-def body_delta_from_model_delta(R_delta_c, p_delta_c, R_e_w, R_c_w):
-    """Case 2: controller wants the relative motion in the BODY (gripper) frame e.
+def gripper_delta_from_model_delta(R_delta_c, p_delta_c, R_e_w, R_c_w):
+    """Case 2: controller wants the relative motion in the GRIPPER frame e.
 
-    Converts the model's frame-c delta into the body frame, returning
+    Converts the model's frame-c delta into the gripper frame, returning
     (R_{e->e*}^e, p_{e->e*}^e). Needs only the current EEF orientation R_e^w and the
     frame-c orientation R_c^w, via R_c^e = (R_e^w)^T R_c^w.
     """
     R_c_e = torch.matmul(_f32(R_e_w).transpose(-1, -2), _f32(R_c_w))  # R_c^e = R_w^e R_c^w
-    return change_delta_frame(R_delta_c, p_delta_c, R_c_e)
+    return change_delta_pose_frame(R_delta_c, p_delta_c, R_c_e)

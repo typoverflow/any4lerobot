@@ -21,7 +21,17 @@ ACTION_NAMES = {
     "world_eef_xyz": ["x", "y", "z"],
     "world_eef_rpy": ["roll", "pitch", "yaw"],
     "world_eef_rot6d": ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"],
-    "body_eef_xyz": ["x", "y", "z"],
-    "body_eef_rot6d": ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"],
+    "gripper_eef_xyz": ["x", "y", "z"],
+    "gripper_eef_rot6d": ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"],
     "gripper_state": ["gripper"],
 }
+
+# Per design_of_state_and_action_space.md, the default action target e* is the ground-truth next pose.
+# When a dataset also ships a meaningful pose *command*, the same delta fields are emitted a second time
+# with a ``_command`` suffix (computed against the commanded e*). Register those variants automatically.
+_COMMAND_ACTION_KEYS = (
+    "diff_eef_xyz", "diff_eef_rpy", "diff_joint_pos",
+    "world_eef_xyz", "world_eef_rpy", "world_eef_rot6d",
+    "gripper_eef_xyz", "gripper_eef_rot6d",
+)
+ACTION_NAMES.update({f"{k}_command": ACTION_NAMES[k] for k in _COMMAND_ACTION_KEYS})

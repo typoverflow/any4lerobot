@@ -11,7 +11,7 @@ Import the one matching your framework, e.g.::
 
     from alignment import transforms_numpy as T   # or transforms_torch / transforms_tf
     R = T.rpy_to_matrix(rpy, extrinsic=True)
-    body_R, body_p = T.relative_pose(R_e, p_e, R_estar, p_estar)
+    gripper_R, gripper_p = T.gripper_delta_pose(R_e, p_e, R_estar, p_estar)
     R_estar_w, p_estar_w = T.world_pose_from_model_delta(R_dc, p_dc, R_e, p_e, R_c_w)
 
 The submodules are intentionally NOT imported here so that importing ``alignment``

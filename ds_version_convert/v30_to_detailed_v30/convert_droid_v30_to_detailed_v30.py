@@ -22,13 +22,13 @@ Per-frame entries of the output dataset:
     action.world_eef_xyz     = p_{t+1} - p_t                  (world frame, last step = 0)
     action.world_eef_rpy     = rpy_{t+1} - rpy_t              (componentwise, last step = 0)
     action.world_eef_rot6d   = 6D of R_{t+1} R_t^T            (world frame, last step = identity)
-    action.body_eef_xyz      = R_t^T (p_{t+1} - p_t)          (body frame, last step = 0)
-    action.body_eef_rot6d    = 6D of R_t^T R_{t+1}            (body frame, last step = identity)
+    action.gripper_eef_xyz      = R_t^T (p_{t+1} - p_t)          (gripper frame, last step = 0)
+    action.gripper_eef_rot6d    = 6D of R_t^T R_{t+1}            (gripper frame, last step = identity)
     action.joint_position    = joint_{t+1} - joint_t          (realized delta, last step = 0)
     action.gripper_state     = 1 - action.gripper_position
                                # commanded ABSOLUTE gripper target (not a delta), inverted like
                                # gripper_state: 1 = command fully open, 0 = command fully closed
-    action                   = [body_eef_xyz, body_eef_rot6d, gripper_state]              (10)
+    action                   = [gripper_eef_xyz, gripper_eef_rot6d, gripper_state]              (10)
 
 All rotation features use DROID's native euler convention -- extrinsic (fixed-axis) XYZ,
 R = Rz(yaw) @ Ry(pitch) @ Rx(roll) -- matching the updated droid_baseact_transform.
@@ -81,20 +81,20 @@ ACTION_NAMES = {
     "world_eef_xyz": ["x", "y", "z"],
     "world_eef_rpy": ["roll", "pitch", "yaw"],
     "world_eef_rot6d": ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"],
-    "body_eef_xyz": ["x", "y", "z"],
-    "body_eef_rot6d": ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"],
+    "gripper_eef_xyz": ["x", "y", "z"],
+    "gripper_eef_rot6d": ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"],
     "joint_position": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"],
     "gripper_state": ["gripper"],
 }
 # key order matches the dict insertion order of droid_baseact_transform
 STATE_KEYS = ["eef_xyz", "eef_rpy", "joint_position", "gripper_state", "eef_rot6d"]
 ACTION_KEYS = [
-    "world_eef_xyz", "world_eef_rpy", "world_eef_rot6d", "body_eef_xyz", "body_eef_rot6d",
+    "world_eef_xyz", "world_eef_rpy", "world_eef_rot6d", "gripper_eef_xyz", "gripper_eef_rot6d",
     "joint_position", "gripper_state",
 ]
-# OXE_DATASET_CONFIGS["droid"]: observation.state / action reference vectors (single-arm -> body frame)
+# OXE_DATASET_CONFIGS["droid"]: observation.state / action reference vectors (single-arm -> gripper frame)
 STATE_ENCODING = [("eef_xyz", 3), ("eef_rpy", 3), ("eef_rot6d", 6), ("joint_position", 7), ("gripper_state", 1)]
-ACTION_ENCODING = [("body_eef_xyz", 3), ("body_eef_rot6d", 6), ("gripper_state", 1)]
+ACTION_ENCODING = [("gripper_eef_xyz", 3), ("gripper_eef_rot6d", 6), ("gripper_state", 1)]
 
 # columns copied verbatim from the source data parquets
 PASSTHROUGH_COLUMNS = ["timestamp", "frame_index", "episode_index", "index", "task_index"]
@@ -142,16 +142,16 @@ def matrix_to_rotation_6d(matrix: np.ndarray) -> np.ndarray:
     return np.concatenate((matrix[..., 0, :], matrix[..., 1, :]), axis=-1)
 
 
-def world_body_eef_motion(xyz: np.ndarray, rpy: np.ndarray, extrinsic: bool = False) -> dict[str, np.ndarray]:
-    """See transform_utils.world_body_eef_motion: per-step forward relative eef motion in the world
-    and body frames; action[t] pairs with observation[t]; the last step has no successor, so its
+def world_gripper_eef_motion(xyz: np.ndarray, rpy: np.ndarray, extrinsic: bool = False) -> dict[str, np.ndarray]:
+    """See transform_utils.world_gripper_eef_motion: per-step forward relative eef motion in the world
+    and gripper frames; action[t] pairs with observation[t]; the last step has no successor, so its
     delta is zero translation / identity rotation."""
     R = rpy_to_matrix(rpy, extrinsic=extrinsic)  # [T, 3, 3]
     R_curr_T = np.swapaxes(R[:-1], -1, -2)        # R_t^T
     dp = xyz[1:] - xyz[:-1]                        # world-frame translation delta
     world_rot6d = matrix_to_rotation_6d(R[1:] @ R_curr_T)  # 6D of R_{t+1} R_t^T
-    body_rot6d = matrix_to_rotation_6d(R_curr_T @ R[1:])   # 6D of R_t^T R_{t+1}
-    body_xyz = (R_curr_T @ dp[..., None])[..., 0]          # R_t^T (p_{t+1} - p_t)
+    gripper_rot6d = matrix_to_rotation_6d(R_curr_T @ R[1:])   # 6D of R_t^T R_{t+1}
+    gripper_xyz = (R_curr_T @ dp[..., None])[..., 0]          # R_t^T (p_{t+1} - p_t)
     world_rpy = rpy[1:] - rpy[:-1]
     eye6 = matrix_to_rotation_6d(np.eye(3)[None])          # 6D of identity
     zero3 = np.zeros((1, 3))
@@ -159,8 +159,8 @@ def world_body_eef_motion(xyz: np.ndarray, rpy: np.ndarray, extrinsic: bool = Fa
         "world_eef_xyz": np.concatenate([dp, zero3], axis=0),
         "world_eef_rpy": np.concatenate([world_rpy, zero3], axis=0),
         "world_eef_rot6d": np.concatenate([world_rot6d, eye6], axis=0),
-        "body_eef_xyz": np.concatenate([body_xyz, zero3], axis=0),
-        "body_eef_rot6d": np.concatenate([body_rot6d, eye6], axis=0),
+        "gripper_eef_xyz": np.concatenate([gripper_xyz, zero3], axis=0),
+        "gripper_eef_rot6d": np.concatenate([gripper_rot6d, eye6], axis=0),
     }
 
 
@@ -179,7 +179,7 @@ def transform_episode(cart, joint, grip, act_grip) -> dict[str, np.ndarray]:
     # DROID's native euler is extrinsic (fixed-axis) XYZ, so build rotations with extrinsic=True.
     state["eef_rot6d"] = matrix_to_rotation_6d(rpy_to_matrix(state["eef_rpy"], extrinsic=True))
 
-    motion = world_body_eef_motion(state["eef_xyz"], state["eef_rpy"], extrinsic=True)
+    motion = world_gripper_eef_motion(state["eef_xyz"], state["eef_rpy"], extrinsic=True)
     joint_delta = np.concatenate([joint[1:] - joint[:-1], np.zeros((1, joint.shape[1]))], axis=0)
     action = {
         **motion,

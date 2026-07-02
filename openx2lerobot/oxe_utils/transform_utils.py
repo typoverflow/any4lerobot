@@ -283,7 +283,7 @@ def relative_eef_motion(xyz: tf.Tensor, rotation: tf.Tensor, rot_type: str = "eu
         rel_xyz:   [T, 3] literal world-frame translation difference ``p_{t+1} - p_t``.
         rel_euler: [T, 3] componentwise euler "XYZ" difference of the input rotations.
         rel_quat:  [T, 4] componentwise quaternion (x, y, z, w) difference of the input rotations.
-        rel_rot6d: [T, 6] body-frame relative rotation ``R_t^T @ R_{t+1}`` in 6D (Zhou et al. 2019).
+        rel_rot6d: [T, 6] gripper-frame relative rotation ``R_t^T @ R_{t+1}`` in 6D (Zhou et al. 2019).
     """
     if rot_type not in ("euler", "quaternion"):
         raise ValueError(f"rot_type={rot_type!r} must be 'euler' or 'quaternion'")
@@ -293,7 +293,7 @@ def relative_eef_motion(xyz: tf.Tensor, rotation: tf.Tensor, rot_type: str = "eu
     rotation = tf.cast(rotation, tf.float32)
     R = to_matrix(rotation)  # [T, 3, 3]
     R_curr_T = tf.linalg.matrix_transpose(R[:-1])
-    rel_R = tf.matmul(R_curr_T, R[1:])  # [T-1, 3, 3] body-frame rotation = T_t^{-1} T_{t+1}
+    rel_R = tf.matmul(R_curr_T, R[1:])  # [T-1, 3, 3] gripper-frame rotation = T_t^{-1} T_{t+1}
     rel_p = xyz[1:] - xyz[:-1]          # [T-1, 3] literal world-frame translation difference
     # dT_{T-1} = identity: the last step has no successor.
     rel_R = tf.concat([rel_R, tf.eye(3, batch_shape=[1])], axis=0)
@@ -327,7 +327,7 @@ def rpy_to_matrix(rpy: tf.Tensor, extrinsic: bool = False) -> tf.Tensor:
           CALVIN / taco_play) and xArm. Equal to intrinsic ZYX evaluated on the reversed angle order.
 
     Pick the value that matches how the *source* produced its rpy; a mismatch yields a wrong ``R``
-    and therefore wrong relative-rotation / rot6d features (see ``world_body_eef_motion``).
+    and therefore wrong relative-rotation / rot6d features (see ``world_gripper_eef_motion``).
     """
     rpy = tf.cast(rpy, tf.float32)
     if extrinsic:
@@ -336,8 +336,8 @@ def rpy_to_matrix(rpy: tf.Tensor, extrinsic: bool = False) -> tf.Tensor:
     return euler_to_matrix(rpy, convention="XYZ")
 
 
-def world_body_eef_motion(xyz: tf.Tensor, rpy: tf.Tensor, extrinsic: bool = False) -> Dict[str, tf.Tensor]:
-    """Per-step forward relative end-effector motion in BOTH the world and body frames.
+def world_gripper_eef_motion(xyz: tf.Tensor, rpy: tf.Tensor, extrinsic: bool = False) -> Dict[str, tf.Tensor]:
+    """Per-step forward relative end-effector motion in BOTH the world and gripper frames.
 
     Inputs are absolute *world-frame* poses: translations ``xyz`` [T, 3] and euler RPY angles
     ``rpy`` [T, 3] = ``(roll, pitch, yaw)``, each ``T_t = [[R_t, p_t], [0, 1]]``. Each returned delta
@@ -355,8 +355,8 @@ def world_body_eef_motion(xyz: tf.Tensor, rpy: tf.Tensor, extrinsic: bool = Fals
         world_eef_xyz:   [T, 3]  ``p_{t+1} - p_t``                  (world frame)
         world_eef_rpy:   [T, 3]  ``rpy_{t+1} - rpy_t`` componentwise (world frame)
         world_eef_rot6d: [T, 6]  6D of ``R_{t+1} R_t^T``           (world frame)
-        body_eef_xyz:    [T, 3]  ``R_t^T (p_{t+1} - p_t)``         (body/gripper frame)
-        body_eef_rot6d:  [T, 6]  6D of ``R_t^T R_{t+1}``           (body/gripper frame)
+        gripper_eef_xyz:    [T, 3]  ``R_t^T (p_{t+1} - p_t)``         (gripper frame)
+        gripper_eef_rot6d:  [T, 6]  6D of ``R_t^T R_{t+1}``           (gripper frame)
     """
     xyz = tf.cast(xyz, tf.float32)
     rpy = tf.cast(rpy, tf.float32)
@@ -366,8 +366,8 @@ def world_body_eef_motion(xyz: tf.Tensor, rpy: tf.Tensor, extrinsic: bool = Fals
     dp = xyz[1:] - xyz[:-1]                         # [T-1, 3] world-frame translation delta
 
     world_rot6d = matrix_to_rotation_6d(tf.matmul(R[1:], R_curr_T))  # 6D of R_{t+1} R_t^T
-    body_rot6d = matrix_to_rotation_6d(tf.matmul(R_curr_T, R[1:]))   # 6D of R_t^T R_{t+1}
-    body_xyz = tf.squeeze(tf.matmul(R_curr_T, dp[..., None]), axis=-1)  # R_t^T (p_{t+1} - p_t)
+    gripper_rot6d = matrix_to_rotation_6d(tf.matmul(R_curr_T, R[1:]))   # 6D of R_t^T R_{t+1}
+    gripper_xyz = tf.squeeze(tf.matmul(R_curr_T, dp[..., None]), axis=-1)  # R_t^T (p_{t+1} - p_t)
     world_rpy = rpy[1:] - rpy[:-1]
 
     # dT for the last step is identity: it has no successor.
@@ -377,8 +377,8 @@ def world_body_eef_motion(xyz: tf.Tensor, rpy: tf.Tensor, extrinsic: bool = Fals
         "world_eef_xyz": tf.concat([dp, zero3], axis=0),
         "world_eef_rpy": tf.concat([world_rpy, zero3], axis=0),
         "world_eef_rot6d": tf.concat([world_rot6d, eye6], axis=0),
-        "body_eef_xyz": tf.concat([body_xyz, zero3], axis=0),
-        "body_eef_rot6d": tf.concat([body_rot6d, eye6], axis=0),
+        "gripper_eef_xyz": tf.concat([gripper_xyz, zero3], axis=0),
+        "gripper_eef_rot6d": tf.concat([gripper_rot6d, eye6], axis=0),
     }
 
 

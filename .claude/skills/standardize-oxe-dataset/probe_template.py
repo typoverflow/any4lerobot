@@ -111,9 +111,9 @@ if RUN_VALIDATE:
         assert all(v.shape[0] == T - 1 for v in ac.values()), "action len"
 
         # body delta reconstructs e*
-        bodyR = A.rotation_6d_to_matrix(ac["body_eef_rot6d"])
+        bodyR = A.rotation_6d_to_matrix(ac["gripper_eef_rot6d"])
         R_rec = np.matmul(R_all[:-1], bodyR)
-        p_rec = xyz[:-1] + np.matmul(R_all[:-1], ac["body_eef_xyz"][..., None])[..., 0]
+        p_rec = xyz[:-1] + np.matmul(R_all[:-1], ac["gripper_eef_xyz"][..., None])[..., 0]
         print(f"ep{ei}: body->R_estar {np.abs(R_rec - R_all[1:]).max():.2e}  "
               f"body->p_estar {np.abs(p_rec - xyz[1:]).max():.2e}  "
               f"world==diff {np.abs(ac['world_eef_xyz'] - ac['diff_eef_xyz']).max():.2e}")
