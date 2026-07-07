@@ -51,9 +51,14 @@ _WORLD_ALIGN_IDENTITY = align_tf.axis_alignment_matrix("x", "y", "z")  # FLU bas
 # physically mounts a Robotiq 2F-85 whose logged TCP may be yawed, so the in-plane (x/y) part is
 # ~medium confidence; z = approach is solid.
 _GRIPPER_ALIGN_FRANKA = align_tf.axis_alignment_matrix("-y", "x", "z")
-# Interbotix WidowX ee_gripper_link: native +x is the approach axis (whole wrist chain is +x offsets),
-# fingers translate along native +y (left/right_finger axis 0 1 0). -> approach +x->z, finger +y->x.
-_GRIPPER_ALIGN_WIDOWX = align_tf.axis_alignment_matrix("z", "x", "y")
+# Bridge/WidowX: the stored rpy is NOT the URDF ee_gripper_link frame (+x approach) -- widowx_envs
+# composes it with DEFAULT_ROTATION = [[0,0,1],[0,1,0],[-1,0,0]], so the stored frame reads ~identity
+# when the gripper points straight down. Hence stored -z = approach and the finger axis is stored y;
+# descent motion maps to canonical +z under this align (verified on bridge_orig). The in-plane SIGN was
+# fixed against video on SOAR (same widowx_envs stack, 2026-07-06): at the neutral gripper-down pose
+# canonical x must read world-RIGHT (= stored -y) and canonical y world-backward (= stored -x); the
+# earlier ("y","x","-z") was 180 degrees off about the approach axis.
+_GRIPPER_ALIGN_WIDOWX = align_tf.axis_alignment_matrix("-y", "-x", "-z")
 # Google / Everyday-Robots link_gripper_tcp: native +z is the approach axis (TCP is a +z offset), but
 # the finger-open axis is NOT documented publicly, so the in-plane orientation is left native
 # (identity) -- z = approach is already correct; revisit the x/y roll if the finger axis is recovered.
@@ -128,6 +133,11 @@ def droid_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     Franka hand -> canonical OpenCV gripper via ``_GRIPPER_ALIGN_FRANKA`` (= NVIDIA Cosmos ``_DROID_TO_OPENCV``).
     """
     obs = trajectory["observation"]
+    # The wrist Zed Mini is mounted below the arm, i.e. rolled 180 deg about the optical axis, so the
+    # raw image x/y point opposite the canonical OpenCV gripper x/y. Rotating the image 180 deg
+    # (reverse H and W; a proper rotation, not a mirror) restores image +x ~ gripper +x, +y ~ gripper +y.
+    # NOTE: raw DROID wrist intrinsics (not shipped in OXE) would need cx,cy -> W-1-cx, H-1-cy.
+    obs["wrist_image_left"] = obs["wrist_image_left"][:, ::-1, ::-1, :]
     eef_xyz, joint = obs["cartesian_position"][:, :3], obs["joint_position"]
     R, p = _to_canonical(align_tf.rpy_to_matrix(obs["cartesian_position"][:, 3:6], extrinsic=True), eef_xyz, _GRIPPER_ALIGN_FRANKA)
     state = {
@@ -184,7 +194,7 @@ def bridge_oxe_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 def bridge_orig_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     """BridgeData V2 (WidowX). state [7] = eef xyz + extrinsic-XYZ rpy + gripper (1=open); no extrinsics.
     Default e* = ground-truth next pose (last step a dummy no-op); NO ``*_command`` (the raw action is the
-    unreliable one the repo relabels to the state delta). WidowX ee_gripper_link (native +x = approach) ->
+    unreliable one the repo relabels to the state delta). Stored widowx_envs gripper frame ->
     canonical OpenCV gripper via ``_GRIPPER_ALIGN_WIDOWX``.
     """
     obs = trajectory["observation"]

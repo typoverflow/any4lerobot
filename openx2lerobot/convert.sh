@@ -19,12 +19,12 @@ export TF_NUM_INTEROP_THREADS=2
 PYTHON=/localscratch/cgao304/dev/envs/miniconda3/envs/lerobot/bin/python
 
 "$PYTHON" openx_rlds.py \
-    --raw-dir /localscratch/cgao304/dev/datasets/rlds/droid/1.0.1 \
-    --local-dir /localscratch/cgao304/dev/datasets/lerobot_v3/droid/ \
+    --raw-dir /localscratch/cgao304/dev/datasets/rlds/bridge_orig/0.0.1 \
+    --local-dir /localscratch/cgao304/dev/datasets/lerobot_v3/bridge_orig/ \
     --use-videos \
     --num-proc 8 \
     --image-writer-process 1 \
     --image-writer-threads 4 \
     --prefetch-buffer 2 \
-    --repo-id typoverflow/droid \
+    --repo-id typoverflow/bridge_orig \
     --push-to-hub
