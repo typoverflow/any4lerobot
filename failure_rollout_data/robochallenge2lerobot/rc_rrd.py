@@ -131,6 +131,39 @@ def nearest_indices(src_times: np.ndarray, query_times: np.ndarray) -> np.ndarra
     return np.where(choose_left, pos - 1, pos)
 
 
+def resample_linear(src_times: np.ndarray, values: np.ndarray, query_times: np.ndarray) -> np.ndarray:
+    """Linearly interpolate ``values`` (sampled at ``src_times``) onto ``query_times``.
+
+    ``values`` may be (T,) or (T, d); interpolation is per-column. ``src_times`` must be sorted
+    ascending (``read_arm`` returns it so). Unlike ``nearest_indices``, this removes the staircase
+    quantization of nearest-neighbour resampling -- important when the signal is later differenced
+    (the FK-EEF delta action), where NN steps show up as high-frequency jitter.
+    """
+    src = np.asarray(src_times, dtype=np.float64)
+    q = np.asarray(query_times, dtype=np.float64)
+    vals = np.asarray(values, dtype=np.float64)
+    if vals.ndim == 1:
+        return np.interp(q, src, vals)
+    return np.stack([np.interp(q, src, vals[:, k]) for k in range(vals.shape[1])], axis=1)
+
+
+def smooth_butter(x: np.ndarray, fps: float, cutoff_hz: float, order: int = 2) -> np.ndarray:
+    """Zero-phase Butterworth low-pass along axis 0 (returns float64, same shape as ``x``).
+
+    ``filtfilt`` is zero-phase, so the smoothed signal stays time-aligned with the original -- the
+    per-step delta computed from it (the action) is not lagged. Short signals (whole rollout shorter
+    than ``filtfilt``'s pad length) are returned unfiltered so the rollout still converts.
+    """
+    from scipy.signal import butter, filtfilt  # lazy: scipy import is ~0.3 s
+
+    x = np.asarray(x, dtype=np.float64)
+    b, a = butter(order, cutoff_hz / (fps / 2.0))
+    padlen = 3 * max(len(a), len(b))  # filtfilt's default; it errors when len(x) <= padlen
+    if x.shape[0] <= padlen:
+        return x
+    return filtfilt(b, a, x, axis=0)
+
+
 class NearestFrameStream:
     """Pull the frame nearest a monotonically-increasing query time from a frame generator.
 

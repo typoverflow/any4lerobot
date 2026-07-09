@@ -13,8 +13,12 @@ trajectories). We therefore:
     against HF ``ee_positions`` to <=2 mm / <=0.1 deg -- see ``validate_fk.py``);
   * omit ``raw_target.*`` / ``target.*`` entirely (no commanded target exists -- the GT-next
     target is derived at load time; see ``../dataset.md`` §2.4/§3);
-  * resample joints + each camera onto a uniform 30 fps grid (nearest-neighbour), decoding video
-    one frame at a time so memory stays O(1) in the frame count.
+  * resample joints + each camera onto a uniform 30 fps grid, decoding video one frame at a time so
+    memory stays O(1) in the frame count. ``raw_state.*`` uses a nearest-neighbour resample (raw
+    record); ``state.*`` (and thus the differenced ``debug.*`` action) uses joints linearly
+    interpolated onto the grid and zero-phase Butterworth low-pass filtered before FK, so the action
+    is not jittered by joint recording noise / NN quantization (``--smooth-cutoff-hz``, default 5 Hz;
+    ``--no-smooth`` to disable).
 
 One LeRobot dataset is produced per embodiment: ARX5, UR5 (single-arm), ALOHA, DOS-W1 (dual-arm).
 
@@ -82,18 +86,23 @@ CAMS_DUAL = {"/videos_front": "cam_high", "/videos_left": "cam_left_wrist", "/vi
 # gripper_max = physical max opening (m) used to normalize the gripper width to [0, 1].
 # gripper_align = native gripper -> canonical OpenCV relabel; drives both state.eef_* and
 # debug.* (world align is identity for all robots). Status after the sample-video review:
-#   ALOHA  = ("y","-x","z")  -- vifailback-validated PiPER->OpenCV (confirmed)
+#   ALOHA  = ("y","-x","z") both arms (FK validated vs HF left-arm ee to 0.027deg -> frame is correct
+#            & right-handed). Same PiPER relabel as vifailback; a 30-episode / 10-task sample confirmed
+#            the per-arm action matches the wrist-camera motion for BOTH arms (see README) -- there is
+#            NO left/right mirror flip (the base mounting cancels in the gripper-frame action).
 #   UR5    = None            -- native frame confirmed correct by reviewer
-#   ARX5   = None            -- UNVERIFIED placeholder (reviewer could not judge from video)
-#   DOS-W1 = None            -- UNVERIFIED placeholder (same)
-# For the unverified pair state.eef_rot6d == raw_state.eef_rot6d until a relabel is set. The
+#   ARX5   = ("z","-x","-y") -- confirmed from action viz (native x=approach,y=left,z=up -> OpenCV)
+#   DOS-W1 = None            -- UNVERIFIED placeholder (reviewer could not judge from video)
+# For the unverified DOS-W1, state.eef_rot6d == raw_state.eef_rot6d until a relabel is set. The
 # optical-flow probe in infer_gripper_axes.py failed its PiPER validation (1/3 axes, R^2<=0.12),
 # so nothing is baked in for them. See README "Conversion status".
 ROBOTS = {
     "arx5": dict(
         robot_type="arx5", dual=False, urdf="assets/arx5.urdf",
         base="base_link", tip="eef_link", tool_offset=(0.0, 0.0, 0.0),
-        gripper_max=0.088, gripper_align=None,
+        # Native gripper frame (confirmed from the action viz): x=approach, y=left, z=up. Relabel to
+        # OpenCV (z=fwd, x=right, y=down): native x->z, y->-x (left=-right), z->-y (up=-down).
+        gripper_max=0.088, gripper_align=("z", "-x", "-y"),
     ),
     "ur5": dict(
         robot_type="ur5", dual=False, urdf="assets/ur5.urdf",
@@ -105,7 +114,15 @@ ROBOTS = {
         robot_type="aloha_agilex_piper", dual=True,
         urdf="../vifailback2lerobot/assets/piper_description.urdf",
         base="base_link", tip="link6", tool_offset=(0.0, 0.0, 0.0),
-        gripper_max=0.10, gripper_align=("y", "-x", "z"),  # PiPER native gripper -> OpenCV (vifailback)
+        # Both arms use the SAME PiPER native gripper -> OpenCV relabel (vifailback). FK is validated
+        # against the HF LEFT-arm ee_positions to 0.027deg (validate_fk.py), so each arm's computed
+        # gripper frame is physically correct & right-handed -> this align gives both arms canonical
+        # OpenCV in their OWN frame. The per-step action is expressed in each arm's own gripper body
+        # frame (T_t^-1 T_{t+1}), so the arm's base mounting cancels: identical actions produce
+        # identical wrist-camera motion on BOTH arms -- confirmed on a 30-episode / 10-task sample,
+        # same as vifailback. (There is NO left/right mirror/reflection; an earlier note claiming one
+        # was wrong.) Per-arm gripper_align IS supported (dict) if a genuine per-arm need ever arises.
+        gripper_max=0.10, gripper_align=("y", "-x", "z"),
     ),
     "dos_w1": dict(
         robot_type="dexmal_dos_w1", dual=True, urdf="assets/dos_w1.urdf",
@@ -183,16 +200,40 @@ def discover_rollouts(data_dir: Path, robot: str) -> list[dict]:
 # --------------------------------------------------------------------------------------
 # Per-rollout processing
 # --------------------------------------------------------------------------------------
-def _arm_state(arm, grid, cfg, fk):
-    """Resample one arm's (times, joints, gripper) onto ``grid`` -> raw_state + state + debug."""
+def resolve_gripper_align(cfg, side):
+    """This arm's native-gripper -> OpenCV relabel. ``gripper_align`` may be a single spec (both
+    arms / single-arm) or a per-side dict ``{'left': ..., 'right': ...}`` for a dual robot whose two
+    grippers genuinely differ. ALOHA uses a single shared spec (both arms are identical PiPER and,
+    as verified, need no per-arm distinction)."""
+    ga = cfg["gripper_align"]
+    return ga[side] if isinstance(ga, dict) else ga
+
+
+def _arm_state(arm, grid, cfg, fk, fps, cutoff_hz, order, smooth, gripper_align):
+    """Resample one arm's (times, joints, gripper) onto ``grid`` -> raw_state + state + debug.
+
+    ``raw_state.*`` is the un-smoothed native record (nearest-neighbour resample + FK). ``state.*``
+    (and the differenced ``debug.*`` action) use joints linearly interpolated onto the grid and
+    zero-phase Butterworth low-pass filtered before FK, so the action is not jittered by joint
+    recording noise or NN-quantization. ``smooth=False`` keeps the linear-interp joints unfiltered.
+    ``gripper_align`` is this arm's native-gripper -> OpenCV relabel (per-arm for dual robots).
+    """
+    # raw_state: nearest-neighbour resample of the native recording (kept un-smoothed).
     idx = rc_rrd.nearest_indices(arm["times"], grid)
-    joints = arm["joints"][idx].astype(np.float32)    # (T, 6)
+    raw_joints = arm["joints"][idx].astype(np.float32)      # (T, 6)
     width = arm["gripper"][idx][:, None].astype(np.float32)  # (T, 1) raw meters
-    R, p = fk(joints)                                 # native arm-base frame
+    R_raw, p_raw = fk(raw_joints)                            # native arm-base frame
+
+    # state: linear-interp joints onto the grid, low-pass, then FK (smooth pose -> smooth action).
+    sm_joints = rc_rrd.resample_linear(arm["times"], arm["joints"], grid)
+    if smooth:
+        sm_joints = rc_rrd.smooth_butter(sm_joints, fps, cutoff_hz, order)
+    sm_joints = sm_joints.astype(np.float32)
+    R, p = fk(sm_joints)
     grip_norm = np.clip(width / cfg["gripper_max"], 0.0, 1.0).astype(np.float32)
 
-    # Canonical pose: world -> identity, gripper -> OpenCV relabel (per robot; None = native).
-    R_align = None if cfg["gripper_align"] is None else tn.axis_alignment_matrix(*cfg["gripper_align"])
+    # Canonical pose: world -> identity, gripper -> OpenCV relabel (per arm; None = native).
+    R_align = None if gripper_align is None else tn.axis_alignment_matrix(*gripper_align)
     R_c, p_c = tn.align_axis(R, p, np.eye(3, dtype=np.float32), R_align)
 
     # Debug: GT-next delta in the canonical gripper frame (last step no-op).
@@ -200,11 +241,11 @@ def _arm_state(arm, grid, cfg, fk):
     dbg_xyz = np.concatenate([p_g, np.zeros((1, 3), np.float32)]).astype(np.float32)
     dbg_rot = np.concatenate([tn.matrix_to_rotation_6d(R_g), _IDENTITY_ROT6D]).astype(np.float32)
     return {
-        "raw_joint_pos": joints,
-        "raw_eef_xyz": p.astype(np.float32),
-        "raw_eef_rot6d": tn.matrix_to_rotation_6d(R).astype(np.float32),
+        "raw_joint_pos": raw_joints,
+        "raw_eef_xyz": p_raw.astype(np.float32),
+        "raw_eef_rot6d": tn.matrix_to_rotation_6d(R_raw).astype(np.float32),
         "raw_gripper_state": width,
-        "joint_pos": joints,  # frame-independent, copied
+        "joint_pos": sm_joints,  # smoothed (state.* is the smoothed record)
         "eef_xyz": p_c.astype(np.float32),
         "eef_rot6d": tn.matrix_to_rotation_6d(R_c).astype(np.float32),
         "gripper_state": grip_norm,
@@ -213,7 +254,7 @@ def _arm_state(arm, grid, cfg, fk):
     }
 
 
-def process_rollout(job: dict, cfg: dict, fps: int, fk):
+def process_rollout(job: dict, cfg: dict, fps: int, fk, cutoff_hz: float, order: int, smooth: bool):
     """Return (T, state_data dict, camera-stream dict, instruction, provenance).
 
     ``state_data`` holds small (T, d) arrays. Camera frames are NOT materialized here; the
@@ -234,7 +275,8 @@ def process_rollout(job: dict, cfg: dict, fps: int, fk):
 
     state_data = {}
     for pfx, side in zip(prefixes, sides):
-        arm = _arm_state(arms[pfx], grid, cfg, fk)
+        arm = _arm_state(arms[pfx], grid, cfg, fk, fps, cutoff_hz, order, smooth,
+                         resolve_gripper_align(cfg, side))
         pre = f"{side}_" if side else ""
         state_data[f"raw_state.{pre}joint_pos"] = arm["raw_joint_pos"]
         state_data[f"raw_state.{pre}eef_xyz"] = arm["raw_eef_xyz"]
@@ -358,7 +400,9 @@ def convert_worker(args, jobs, local_dir: Path, repo_id: str, desc: str, positio
     pbar = tqdm(total=len(todo), desc=desc, unit="ep", position=position, dynamic_ncols=True)
     for job in todo:
         try:
-            T, state_data, streams, grid, instruction, prov = process_rollout(job, cfg, args.fps, fk)
+            T, state_data, streams, grid, instruction, prov = process_rollout(
+                job, cfg, args.fps, fk, args.smooth_cutoff_hz, args.smooth_order, args.smooth
+            )
             add_rollout_frames(dataset, T, state_data, streams, grid, instruction, black)
             dataset.save_episode()
             metadata_file.parent.mkdir(parents=True, exist_ok=True)
@@ -419,7 +463,11 @@ def run_parallel(args):
             "--shard-index", str(i), "--num-shards", str(n), "--fps", str(args.fps),
             "--image-writer-process", str(args.image_writer_process),
             "--image-writer-threads", str(args.image_writer_threads),
+            "--smooth-cutoff-hz", str(args.smooth_cutoff_hz),
+            "--smooth-order", str(args.smooth_order),
         ]
+        if not args.smooth:
+            cmd.append("--no-smooth")
         if args.use_videos:
             cmd.append("--use-videos")
         if args.skip_bad_episodes:
@@ -481,6 +529,11 @@ def main():
     p.add_argument("--max-episodes", type=int, default=None, help="Debug: convert at most this many rollouts.")
     p.add_argument("--skip-bad-episodes", action="store_true")
     p.add_argument("--overwrite", action="store_true")
+    # state.* joint smoothing (zero-phase Butterworth low-pass before FK); raw_state.* stays un-smoothed.
+    p.add_argument("--smooth-cutoff-hz", type=float, default=5.0, help="Butterworth low-pass cutoff (Hz) for state.* joints.")
+    p.add_argument("--smooth-order", type=int, default=2, help="Butterworth filter order for state.* joints.")
+    p.add_argument("--no-smooth", dest="smooth", action="store_false", help="Disable state.* joint smoothing (linear-interp only).")
+    p.set_defaults(smooth=True)
     args = p.parse_args()
     if args.repo_id is None:
         args.repo_id = f"robochallenge_{args.robot}"

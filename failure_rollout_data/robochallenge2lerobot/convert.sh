@@ -4,15 +4,18 @@
 # sentinels + mid-list progress). Set DATA_DIR / OUT_DIR / NUM_PROC to taste.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 PY="${PY:-/localscratch/cgao304/dev/envs/miniconda3/envs/lerobot/bin/python}"
 DATA_DIR="${DATA_DIR:-/localscratch/cgao304/dev/datasets/robochallenge/data}"
 OUT_DIR="${OUT_DIR:-/localscratch/cgao304/dev/datasets/robochallenge/lerobot}"
 NUM_PROC="${NUM_PROC:-8}"
-ROBOTS="${ROBOTS:-arx5 ur5 aloha dos_w1}"
+# ROBOTS="${ROBOTS:-arx5 ur5 aloha dos_w1}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 
-for robot in $ROBOTS; do
+for robot in aloha; do
   echo "==== converting $robot ===="
   "$PY" convert.py \
     --data-dir "$DATA_DIR" \
