@@ -26,8 +26,8 @@ dataset, every pose is first mapped from its raw frames into the canonical frame
   $R \in SO(3)$ and translation $p \in \mathbb{R}^3$.
 + A primed symbol ($T'_t$, $R'_t$, $p'_t$) is expressed in the **raw** frames; an unprimed
   symbol ($T_t$, $R_t$, $p_t$) is expressed in the **canonical** frames.
-+ $R_a^b$ ("$R_a$-to-$b$") is the orientation of frame $a$ expressed in frame $b$; a vector
-  converts as $v^b = R_a^b\, v^a$. We write $w'/e'$ for the raw base/EEF frames and
++ $R_a^b$ (" $R_a$ to $b$ ") is the orientation of frame $a$ expressed in frame $b$; a vector
+  converts as $v^b = R_a^b\  v^a$. We write $w'/e'$ for the raw base/EEF frames and
   $w/e$ for the canonical base/EEF frames.
 + A star ($\cdot^{\ast}$) marks the **target** (commanded / next) quantity that drives an action.
 
@@ -45,8 +45,8 @@ the canonical pose $T_t=(R_t, p_t)$ by re-basing the world reference on the left
 relabeling the EEF axes on the right:
 
 $$
-p_t = R_{w'}^w\, p'_t , \qquad
-R_t = R_{w'}^w\, R'_t\, R_e^{e'} , \qquad R_e^{e'} = (R_{e'}^e)^{-1} .
+p_t = R_{w'}^w\ p'_t , \qquad
+R_t = R_{w'}^w\ R'_t\ R_e^{e'} , \qquad R_e^{e'} = (R_{e'}^e)^{-1} .
 $$
 
 Joint angles are frame-independent and are left unchanged.
@@ -58,25 +58,25 @@ Joint angles are frame-independent and are left unchanged.
 ### 1.3 Relative Motion and Reference Frames
 
 Absolute poses give *where* the EEF is; control and learning usually need the **relative
-motion** from the current pose $T_t$ to a target pose $T_t^{\ast}$ (both already aligned to
+motion** from the current pose $T_e$ to a target pose $T_{e^*}$ (both already aligned to
 canonical). The EEF-frame relative transform is
 
 $$
-T_{t\to \ast}^e = T_t^{-1}\, T_t^{\ast} , \qquad
-R_{t\to \ast}^e = R_t^\top R_t^{\ast} , \qquad
-p_{t\to \ast}^e = R_t^\top\,(p_t^{\ast} - p_t) .
+T_{e\to e^\ast}^e = T_{e}^{-1}\ T_{e^*} , \qquad
+R_{e\to e^\ast}^e = R_{e}^\top R_{e^*} , \qquad
+p_{e\to e^\ast}^e = R_e^\top\ (p_{e^\ast} - p_e) .
 $$
 
 This EEF-frame pair is *sufficient*: the same motion in any other frame $c$ (world,
 camera, …) is recovered from the known $R_e^c$ by conjugation,
 
 $$
-R_{t\to \ast}^c = R_e^c\, R_{t\to \ast}^e\, R_c^e , \qquad
-p_{t\to \ast}^c = R_e^c\, p_{t\to \ast}^e .
+R_{e\to e^\ast}^c = R_e^c\ R_{e\to e^\ast}^e\ R_c^e , \qquad
+p_{e\to e^\ast}^c = R_e^c\ p_{e\to e^\ast}^e .
 $$
 
-Two common cases: the **world** frame ($c = w$, $R_e^w = R_t$) gives
-$R_{t\to \ast}^w = R_t\, R_{t\to \ast}^e\, R_t^\top$ and $p_{t\to \ast}^w = p_t^{\ast} - p_t$; a **camera**
+Two common cases: the **world** frame ($c = w$, $R_e^w = R_e$) gives
+$R_{e\to e^\ast}^w = R_e\ R_{e\to e^\ast}^e\ R_e^\top$ and $p_{e\to e^\ast}^w = p_{e^\ast} - p_e$; a **camera**
 frame uses that camera's extrinsics for $R_e^c$.
 
 ## 2. What will be included in the dataset
@@ -88,13 +88,13 @@ The `raw_state.*` contains a detailed group of metrics present in the original d
 
 Missing entries from the raw dataset will be omitted.
 
-| entry name                                         | meaning                                                                                                                                                |
-| :------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `raw_state.joint_pos`                                         | joint position (in rad)                                                                                                                       |
-| `raw_state.joint_vel`                                         | joint velocity                                                                                                                                |
-| `raw_state.eef_xyz`                                           | translation $p'_t$ of the EEF in the raw base frame                                                                                          |
-| `raw_state.eef_rot6d`/`raw_state.eef_rpy`/`raw_state.eef_quat`| rotation $R'_t$ of the EEF (raw EEF frame in raw base frame), in a specific representation. Only keep the one shipped by the original dataset. |
-| `raw_state.gripper_state`                                     | raw gripper state from the dataset                                                                                                            |
+| entry name                                                     | meaning                                                                                                                                        |
+| :------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| `raw_state.joint_pos`                                          | joint position (in rad)                                                                                                                        |
+| `raw_state.joint_vel`                                          | joint velocity                                                                                                                                 |
+| `raw_state.eef_xyz`                                            | translation $p'_t$ of the EEF in the raw base frame                                                                                            |
+| `raw_state.eef_rot6d`/`raw_state.eef_rpy`/`raw_state.eef_quat` | rotation $R'_t$ of the EEF (raw EEF frame in raw base frame), in a specific representation. Only keep the one shipped by the original dataset. |
+| `raw_state.gripper_state`                                      | raw gripper state from the dataset                                                                                                             |
 
 ### 2.2 `raw_target.*`
 The `raw_target.*` contains the desired target state sent to the low-level controller. No transformation or alignment is done. If the raw dataset contains action commands that express the delta transformation, it will be applied to the raw state to get the absolute raw target. The entries are the same as `raw_state`; otherwise, for example the dataset does not ship commands and wants you to use the ground-truth next state as the target, this group will be omitted. 
@@ -105,20 +105,20 @@ For joint velocity control, `raw_target.joint_vel` will be the absolute desired 
 
 ### 2.3 `state.*`
 We apply a series of transformations and alignments to the original dataset to get the canonical states:
-1. Compute the EEF orientation as a rotation matrix $R_t$ and store it in **6D representation**: rot6d is the flattened first two rows of $R_t$, $\mathrm{rot6d}(R_t) = [\,R_{11}, R_{12}, R_{13},\; R_{21}, R_{22}, R_{23}\,] \in \mathbb{R}^6$. The third row (and thus the full matrix) is recovered by Gram–Schmidt at load time.
+1. Compute the EEF orientation as a rotation matrix $R_t$ and store it in **6D representation**: rot6d is the flattened first two rows of $R_t$, $\mathrm{rot6d}(R_t) = [\ R_{11}, R_{12}, R_{13},\; R_{21}, R_{22}, R_{23}\ ] \in \mathbb{R}^6$. The third row (and thus the full matrix) is recovered by Gram–Schmidt at load time.
 2. Apply axis alignment to map the pose into the canonical base and EEF frames (see [Axis Alignment](#12-axis-alignment)).
 3. Normalize the gripper state to $[0, 1]$ by dividing by its maximum value, where 0 is fully closed and 1 is fully open. If the raw gripper state is binary, keep the binary and verify the sign convention.
 
-| entry name             | meaning                                                                                     |
-| :--------------------- | :------------------------------------------------------------------------------------------ |
-| `state.joint_pos`      | joint position (in rad); frame-independent, copied from `raw_state`                         |
-| `state.joint_vel`      | joint velocity; frame-independent, copied from `raw_state`                                   |
-| `state.eef_xyz`        | canonical translation $p_t$ of the EEF in the canonical base frame                           |
-| `state.eef_rot6d`      | canonical EEF rotation $R_t$ (canonical EEF frame in canonical base frame), as rot6d         |
-| `state.gripper_state`  | gripper state normalized to $[0, 1]$ (0 = fully closed, 1 = fully open), or kept binary      |
+| entry name            | meaning                                                                                 |
+| :-------------------- | :-------------------------------------------------------------------------------------- |
+| `state.joint_pos`     | joint position (in rad); frame-independent, copied from `raw_state`                     |
+| `state.joint_vel`     | joint velocity; frame-independent, copied from `raw_state`                              |
+| `state.eef_xyz`       | canonical translation $p_t$ of the EEF in the canonical base frame                      |
+| `state.eef_rot6d`     | canonical EEF rotation $R_t$ (canonical EEF frame in canonical base frame), as rot6d    |
+| `state.gripper_state` | gripper state normalized to $[0, 1]$ (0 = fully closed, 1 = fully open), or kept binary |
 
 ### 2.4 `target.*`
-Same fields and transformations as `state.*`, applied to the canonical `raw_target.*`. The target $\cdot^{\ast}$ is always the command actually sent to the controller during collection; if the dataset ships no such command, this group is omitted (mirroring `raw_target.*`). When a ground-truth-next target ($T_t^{\ast} = T_{t+1}$) is desired instead, derive it from the next `state.*` at load time.
+Same fields and transformations as `state.*`, applied to the canonical `raw_target.*`. The target $\cdot^{\ast}$ is always the command actually sent to the controller during collection; if the dataset ships no such command, this group is omitted (mirroring `raw_target.*`). When a ground-truth-next target ($T_{e^*} = T_{t+1}$) is desired instead, derive it from the next `state.*` at load time.
 
 ## 3. How to calculate the action at load time?
 
@@ -126,6 +126,6 @@ Actions are computed at load time from `state.*` (current, step $t$) and `target
 
 1. **Joint-position control** — the per-step joint delta $\Delta q = q^{\ast} - q$, where $q$ is `state.joint_pos` and $q^{\ast}$ is `target.joint_pos`.
 2. **Joint-velocity control** — the desired velocity itself, `target.joint_vel` (already absolute; no differencing).
-3. **EEF-pose control** — the EEF-frame relative motion $(R_{t\to \ast}^e, p_{t\to \ast}^e)$ of §[1.3](#13-relative-motion-and-reference-frames), from the canonical current pose $T_t$ (`state.*`) to the target pose $T_t^{\ast}$ (`target.*`). To express the same motion in another frame $c$ (world, camera, …), apply the conjugation in §[1.3](#13-relative-motion-and-reference-frames).
+3. **EEF-pose control** — the EEF-frame relative motion $(R_{e\to e^\ast}^e, p_{e\to e^\ast}^e)$ of §[1.3](#13-relative-motion-and-reference-frames), from the canonical current pose $T_t$ (`state.*`) to the target pose $T_t^{\ast}$ (`target.*`). To express the same motion in another frame $c$ (world, camera, …), apply the conjugation in §[1.3](#13-relative-motion-and-reference-frames).
 
 In every mode the gripper action is the target gripper state, `target.gripper_state` (normalized as in §[2.3](#23-state)).
