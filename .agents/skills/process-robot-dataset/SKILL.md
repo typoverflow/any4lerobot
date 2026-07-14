@@ -100,6 +100,14 @@ Choose one episode timeline. Resample each stream according to its semantics: im
 
 Store task, success/failure, source episode identity, control mode, camera availability, and quality-control decisions in features or metadata as appropriate.
 
+## Write conversion metadata
+
+Always write `meta/conversion_config.json` as required by `failure_rollout_data/dataset.md`.
+Record the actual controller scales and composition order, world and EEF alignment matrices,
+gripper normalization constants, filtering decisions, whether camera pixels were modified, and
+required load-time camera transforms. Add source-specific assumptions needed to reproduce the
+conversion; never copy configuration values from another dataset without verification.
+
 ## Validate before full conversion
 
 Run conversion on several short episodes and verify:

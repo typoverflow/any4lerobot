@@ -126,6 +126,30 @@ product supplies the third column.
 ### 2.4 `target.*`
 Same fields and transformations as `state.*`, applied to the canonical `raw_target.*`. The target $\cdot^{\ast}$ is always the command actually sent to the controller during collection; if the dataset ships no such command, this group is omitted (mirroring `raw_target.*`). When a ground-truth-next target ($T_{e^*} = T_{t+1}$) is desired instead, derive it from the next `state.*` at load time.
 
+### 2.5 `meta/conversion_config.json`
+
+Every converted dataset must include `meta/conversion_config.json`. Record the actual
+dataset-specific choices needed to reproduce and interpret the conversion, including controller
+scales and composition order, world and EEF alignment matrices, gripper normalization constants,
+filtering decisions, camera modifications, and any load-time camera transform. Do not blindly
+copy values between datasets; omit inapplicable fields and add fields required by the source.
+
+For example, the LIBERO Plus conversion records:
+
+```json
+{
+  "position_action_scale": 0.05,
+  "rotation_action_scale": 0.5,
+  "rotation_target_composition": "R_target = R_delta @ R_state",
+  "world_alignment": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+  "gripper_alignment": [[0, 1, 0], [-1, 0, 0], [0, 0, 1]],
+  "finger_limit_m": 0.04,
+  "frames_filtered": 0,
+  "camera_videos_modified": false,
+  "canonical_training_camera_transform": "horizontal_flip_both_views_at_load_time"
+}
+```
+
 ## 3. How to calculate the action at load time?
 
 Actions are computed at load time from `state.*` (current, step $t$) and `target.*` (command, step $t$; or the ground-truth next `state.*`, step $t+1$). The action space follows the dataset's control mode:
