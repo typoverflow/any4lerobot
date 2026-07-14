@@ -45,23 +45,79 @@ from tqdm import tqdm
 from lerobot.datasets.aggregate import aggregate_datasets
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
-from oxe_utils.configs import OXE_DATASET_CONFIGS, ActionEncoding, StateEncoding
+from oxe_utils.configs import OXE_DATASET_CONFIGS
 from oxe_utils.transforms import OXE_STANDARDIZATION_TRANSFORMS
 from oxe_utils.constants import STATE_NAMES, ACTION_NAMES
 
 np.set_printoptions(precision=2)
 
+CONTRACT_GROUPS = ("raw_state", "raw_target", "state", "target", "debug")
+ROT6D_NAMES = ["r11", "r21", "r31", "r12", "r22", "r32"]
+ROT9D_NAMES = [f"r{row}{col}" for row in range(1, 4) for col in range(1, 4)]
+
+
+def _contract_feature_names(key: str, shape: tuple[int, ...]) -> list[str]:
+    """Dimension names for fields in failure_rollout_data/dataset.md."""
+    size = int(np.prod(shape)) if shape else 1
+    if key == "eef_xyz" or key == "gripper_eef_xyz":
+        return ["x", "y", "z"]
+    if key == "eef_rpy":
+        return ["roll", "pitch", "yaw"]
+    if key == "eef_quat":
+        return ["x", "y", "z", "w"]
+    if key == "eef_axis_angle":
+        return ["axis_angle_x", "axis_angle_y", "axis_angle_z"]
+    if key == "eef_rot6d" or key == "gripper_eef_rot6d":
+        return ROT6D_NAMES
+    if key == "eef_rot9d":
+        return ROT9D_NAMES
+    if key in ("joint_pos", "joint_vel"):
+        return [f"joint_{i}" for i in range(size)]
+    if key == "gripper_state":
+        return ["gripper"]
+    return [f"{key}_{i}" for i in range(size)]
+
+
+def _decode_bc_z_image(image_bytes):
+    """Decode BC-Z's variable-resolution JPEG and restore its declared 640x512 frame size."""
+    image = tf.io.decode_image(
+        image_bytes, channels=3, expand_animations=False
+    )
+    image.set_shape([None, None, 3])
+    image = tf.image.resize(image, [640, 512], method="bilinear", antialias=True)
+    return tf.cast(
+        tf.clip_by_value(tf.round(image), 0.0, 255.0), tf.uint8
+    )
+
 
 def transform_raw_dataset(episode, dataset_name):
-    traj = next(iter(episode["steps"].batch(episode["steps"].cardinality())))
+    steps = episode["steps"]
+    traj = next(iter(steps.batch(steps.cardinality())))
+    if dataset_name == "bc_z":
+        # The TFDS metadata declares 640x512, but the records contain lower-resolution JPEGs with
+        # the same aspect ratio. SkipDecoding lets the scalar byte strings batch cleanly; decode and
+        # restore every image only after the episode has been batched.
+        traj["observation"]["image"] = tf.map_fn(
+            _decode_bc_z_image,
+            traj["observation"]["image"],
+            fn_output_signature=tf.TensorSpec([640, 512, 3], tf.uint8),
+        )
 
     if dataset_name in OXE_STANDARDIZATION_TRANSFORMS:
         traj = OXE_STANDARDIZATION_TRANSFORMS[dataset_name](traj)
 
-    # The standardization transform populates "state" and "action" as dicts of named sub-features
-    # (e.g. state.eef_xyz, action.eef_rpy, ...). Cast every sub-feature to float32 for LeRobot.
-    traj["state"] = {key: tf.cast(value, tf.float32) for key, value in traj["state"].items()}
-    traj["action"] = {key: tf.cast(value, tf.float32) for key, value in traj["action"].items()}
+    if "raw_state" in traj:
+        # Contract path: preserve the five named groups and do not manufacture a training action.
+        # raw_target/target are optional by design for datasets without recorded controller commands.
+        for group in CONTRACT_GROUPS:
+            if group in traj:
+                traj[group] = {
+                    key: tf.cast(value, tf.float32) for key, value in traj[group].items()
+                }
+    else:
+        # Legacy Open-X path retained for datasets that have not moved to dataset.md yet.
+        traj["state"] = {key: tf.cast(value, tf.float32) for key, value in traj["state"].items()}
+        traj["action"] = {key: tf.cast(value, tf.float32) for key, value in traj["action"].items()}
 
     traj["task"] = traj.pop("language_instruction")
 
@@ -84,10 +140,23 @@ def generate_features_from_raw(episode, builder: tfds.core.DatasetBuilder, use_v
         if "depth" not in key and any(x in key for x in ["image", "rgb"])
     }
 
-    # "state"/"action" are produced by the standardization transform and do not exist on the raw
-    # builder, so derive their specs from one already-transformed episode. Each sub-feature is
-    # batched as (T, D); the per-frame shape is therefore value.shape[1:].
     steps = episode["steps"]
+    if "raw_state" in steps:
+        # dataset.md path: every semantic field is stored independently. In particular, no
+        # observation.state or monolithic action vector is materialized during conversion.
+        contract_features = {}
+        for group in CONTRACT_GROUPS:
+            for key, value in steps.get(group, {}).items():
+                shape = tuple(value.shape[1:])
+                contract_features[f"{group}.{key}"] = {
+                    "dtype": "float32",
+                    "shape": shape,
+                    "names": _contract_feature_names(key, shape),
+                }
+        return {**obs_features, **contract_features}
+
+    # Legacy state/action path. These groups are produced by the standardization transform and do
+    # not exist on the raw builder, so derive their specs from one transformed episode.
     state_features = {
         f"state.{key}": {
             "dtype": "float32",
@@ -167,56 +236,63 @@ def save_as_lerobot_dataset(
     for episode in progress:
         try:
             traj = episode["steps"]
-            num_frames = next(iter(traj["action"].values())).shape[0]
+            contract_format = "raw_state" in traj
+            timeline_group = traj["state"] if contract_format else traj["action"]
+            num_frames = next(iter(timeline_group.values())).shape[0]
             for i in range(num_frames):
                 image_dict = {
                     f"observation.images.{key}": value[i]
                     for key, value in traj["observation"].items()
                     if "depth" not in key and any(x in key for x in ["image", "rgb"])
                 }
-                state_dict = {
-                    f"state.{key}": value[i]
-                    for key, value in traj["state"].items()
-                }
-                action_dict = {
-                    f"action.{key}": value[i]
-                    for key, value in traj["action"].items()
-                }
-                # append the state and action
-                state_vec = []
-                state_encoding = OXE_DATASET_CONFIGS[dataset_name]["state_encoding"]
-                for key, value in state_encoding.items():
-                    if key == "pad":
-                        state_vec.append(np.zeros(value, dtype=np.float32))
-                    else:
-                        state_vec.append(traj["state"][key][i])
-                state_vec = np.concatenate(state_vec, axis=0)
-                action_vec = []
-                action_encoding = OXE_DATASET_CONFIGS[dataset_name]["action_encoding"]
-                for key, value in action_encoding.items():
-                    if key == "pad":
-                        action_vec.append(np.zeros(value, dtype=np.float32))
-                    else:
-                        action_vec.append(traj["action"][key][i])
-                action_vec = np.concatenate(action_vec, axis=0)
-                lerobot_dataset.add_frame(
-                    {
-                        **image_dict,
-                        **state_dict,
-                        **action_dict,
-                        "observation.state": state_vec,
-                        "action": action_vec,
-                        "task": traj["task"][0].decode(),
-                    },
-                )
+                if contract_format:
+                    grouped_features = {
+                        f"{group}.{key}": value[i]
+                        for group in CONTRACT_GROUPS
+                        for key, value in traj.get(group, {}).items()
+                    }
+                    lerobot_dataset.add_frame(
+                        {**image_dict, **grouped_features, "task": traj["task"][0].decode()}
+                    )
+                else:
+                    state_dict = {
+                        f"state.{key}": value[i]
+                        for key, value in traj["state"].items()
+                    }
+                    action_dict = {
+                        f"action.{key}": value[i]
+                        for key, value in traj["action"].items()
+                    }
+                    state_vec = []
+                    state_encoding = OXE_DATASET_CONFIGS[dataset_name]["state_encoding"]
+                    for key, value in state_encoding.items():
+                        if key == "pad":
+                            state_vec.append(np.zeros(value, dtype=np.float32))
+                        else:
+                            state_vec.append(traj["state"][key][i])
+                    state_vec = np.concatenate(state_vec, axis=0)
+                    action_vec = []
+                    action_encoding = OXE_DATASET_CONFIGS[dataset_name]["action_encoding"]
+                    for key, value in action_encoding.items():
+                        if key == "pad":
+                            action_vec.append(np.zeros(value, dtype=np.float32))
+                        else:
+                            action_vec.append(traj["action"][key][i])
+                    action_vec = np.concatenate(action_vec, axis=0)
+                    lerobot_dataset.add_frame(
+                        {
+                            **image_dict,
+                            **state_dict,
+                            **action_dict,
+                            "observation.state": state_vec,
+                            "action": action_vec,
+                            "task": traj["task"][0].decode(),
+                        },
+                    )
             if num_frames > 0:
                 lerobot_dataset.save_episode()
             else:
-                # DROID contains some 0-frame episodes. With no frames added, save_episode() would hit
-                # lerobot's "add one or several frames before calling add_episode" ValueError and kill
-                # the worker. Skip them unconditionally (still counted as consumed below so resume
-                # stays aligned). This is malformed data, not a transient error, so it's always skipped
-                # regardless of --skip-bad-episodes.
+                # Defensive fallback; empty RLDS episodes are normally filtered before transformation.
                 tqdm.write(f"[{desc}] skipping empty episode (0 frames) at index {consumed}")
         except Exception as e:
             # One malformed/undecodable episode shouldn't kill the whole worker when opted in:
@@ -331,8 +407,18 @@ def create_lerobot_dataset(
     # of read order -- safe even though RLDS read order is only deterministic with shuffle_files=False.
     # Apply ``skip(start_offset)`` BEFORE the expensive transform so already-converted episodes are
     # not re-decoded on resume.
-    filter_fn = lambda e: e["success"] if dataset_name == "kuka" else True
-    base_dataset = builder.as_dataset(split=split).filter(filter_fn)
+    def filter_fn(episode):
+        # A transform cannot infer a feature structure from an episode with no steps. DROID contains
+        # a small number of these malformed episodes, so discard them before batching/mapping.
+        keep = episode["steps"].cardinality() > 0
+        if dataset_name == "kuka":
+            keep = tf.logical_and(keep, episode["success"])
+        return keep
+
+    decoders = None
+    if dataset_name == "bc_z":
+        decoders = {"steps": {"observation": {"image": tfds.decode.SkipDecoding()}}}
+    base_dataset = builder.as_dataset(split=split, decoders=decoders).filter(filter_fn)
     if start_offset:
         base_dataset = base_dataset.skip(start_offset)
     raw_dataset = base_dataset.map(partial(transform_raw_dataset, dataset_name=dataset_name))

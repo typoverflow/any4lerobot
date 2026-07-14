@@ -19,7 +19,7 @@ Conventions
                 composes intrinsic XYZ; ``extrinsic=True`` composes fixed-axis XYZ
                 = Rz(yaw) @ Ry(pitch) @ Rx(roll) (ROS tf / scipy 'xyz' / pybullet).
   quaternion  : [..., 4] scalar-LAST (x, y, z, w).
-  rotation_6d : [..., 6] first two *rows* of R, flattened (Zhou et al. 2019).
+  rotation_6d : [..., 6] first two *columns* of R, concatenated (Cosmos convention).
   frame names : R_a^b ("R_a_to_b") is the orientation of frame a expressed in b;
                 v^b = R_a^b v^a. e = end-effector (body), w = world, c = the frame
                 the model was trained in.
@@ -42,7 +42,7 @@ def _matvec(R: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.matmul(R, v.unsqueeze(-1)).squeeze(-1)
 
 
-# --- rotation matrix <-> 6D (Zhou et al. 2019, "rows" convention) --------------------------------
+# --- rotation matrix <-> 6D (Cosmos first-two-columns convention) --------------------------------
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     """6D rotation [..., 6] -> rotation matrix [..., 3, 3] via Gram-Schmidt."""
     d6 = _f32(d6)
@@ -51,13 +51,13 @@ def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     a2_proj = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
     b2 = torch.nn.functional.normalize(a2_proj, dim=-1)
     b3 = torch.linalg.cross(b1, b2, dim=-1)
-    return torch.stack((b1, b2, b3), dim=-2)
+    return torch.stack((b1, b2, b3), dim=-1)
 
 
 def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
-    """Rotation matrix [..., 3, 3] -> 6D [..., 6] (first two rows)."""
+    """Rotation matrix [..., 3, 3] -> 6D [..., 6] (first two columns)."""
     matrix = _f32(matrix)
-    return torch.cat((matrix[..., 0, :], matrix[..., 1, :]), dim=-1)
+    return torch.cat((matrix[..., :, 0], matrix[..., :, 1]), dim=-1)
 
 
 # --- rotation matrix <-> euler (port of pytorch3d, default convention "XYZ") ----------------------

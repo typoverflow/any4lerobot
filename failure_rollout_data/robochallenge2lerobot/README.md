@@ -64,7 +64,7 @@ canonical copies equal the raw ones. Single-arm (`arm`) shown; dual-arm mirrors 
 | `raw_state.eef_xyz`, `raw_state.eef_rot6d` | 3, 6 | FK(raw joints): EEF pose in **native** arm-base frame (no alignment) |
 | `raw_state.gripper_state` | 1 | raw `cur_gripper` width (m) |
 | `state.joint_pos` | 6 | joints linear-interpolated to 30 Hz + **zero-phase Butterworth low-pass** (smoothed; see Smoothing) |
-| `state.eef_xyz`, `state.eef_rot6d` | 3, 6 | canonical FK pose from the **smoothed** joints (world → I; gripper → OpenCV per robot) |
+| `state.eef_xyz`, `state.eef_rot9d` | 3, 9 | canonical FK pose from the **smoothed** joints (world → I; gripper → OpenCV per robot) |
 | `state.gripper_state` | 1 | `clip(cur_gripper / per-robot max, 0, 1)`, **0 = closed, 1 = open** |
 | `debug.gripper_eef_xyz`, `debug.gripper_eef_rot6d` | 3, 6 | GT-next delta in the canonical gripper frame, from the **smoothed** `state.*` poses (last step no-op) |
 | `success` | 1 | rollout `completion` (constant per episode; NaN if unknown) |
@@ -85,7 +85,7 @@ model, user, arena, run+rollout score/completion, ranked flag, tags, …) is wri
   as the canonical FLU world frame). `state.eef_xyz` is FK of the *smoothed* joints while
   `raw_state.eef_xyz` is FK of the raw NN joints, so they differ slightly (sub-mm typical); with
   `--no-smooth` and identity gripper align they coincide. The gripper relabel
-  (native → canonical OpenCV) drives both `state.eef_rot6d` and `debug.*` and is per-robot
+  (native → canonical OpenCV) drives both `state.eef_rot9d` and `debug.*` and is per-robot
   (`gripper_align` in `convert.py::ROBOTS`). Current status **after a sample-video review** (see
   [Conversion status](#conversion-status--resume-here) — one episode per robot pushed to HF):
 
@@ -94,9 +94,9 @@ model, user, arena, run+rollout score/completion, ranked flag, tags, …) is wri
   | **ALOHA** | `('y','-x','z')` (both arms) | ✅ **confirmed** — vifailback PiPER→OpenCV; **FK validated against the HF LEFT-arm `ee_positions` to 0.027°**, so each arm's frame is physically correct & right-handed. A **30-episode / 10-task sample** (`typoverflow/robochallenge_aloha`) confirms the per-arm action matches the wrist-camera motion for **both** arms — identical actions give identical camera motion on left and right (**no** mirror flip), exactly as vifailback. See the dual-arm note below. |
   | **UR5** | `None` (native) | ✅ **confirmed correct by reviewer** — native gripper frame already reads as canonical OpenCV |
   | **ARX5** | `('z','-x','-y')` | ✅ **confirmed from the action viz** — native gripper is x=approach, y=left, z=up → OpenCV (native x→z, y→-x, z→-y) |
-  | **DOS-W1** | `None` (native) | ⚠️ **unverified** — reviewer could not judge from the sample video; `state.eef_rot6d == raw_state.eef_rot6d` (placeholder identity relabel) |
+  | **DOS-W1** | `None` (native) | ⚠️ **unverified** — reviewer could not judge from the sample video; the canonical and raw rotations represent the same matrix (placeholder identity relabel) |
 
-  For the still-unverified **DOS-W1**, `state.eef_rot6d` is a **placeholder** equal to the native
+  For the still-unverified **DOS-W1**, `state.eef_rot9d` is a **placeholder** encoding the same rotation matrix as the native
   `raw_state.eef_rot6d` until a relabel is validated. Tune its `gripper_align` before a full run.
 - **Gripper→OpenCV inference (attempted, not trusted).** `infer_gripper_axes.py` runs vifailback's
   wrist-camera optical-flow probe (correlate tip-frame EEF velocity with mean image flow → signed

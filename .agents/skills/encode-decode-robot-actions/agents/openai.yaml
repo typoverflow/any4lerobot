@@ -1,0 +1,4 @@
+interface:
+  display_name: "Encode and Decode Robot Actions"
+  short_description: "Bridge dataset actions and robot commands"
+  default_prompt: "Use $encode-decode-robot-actions to connect this processed dataset to training and robot inference."

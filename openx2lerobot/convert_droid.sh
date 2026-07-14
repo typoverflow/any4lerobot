@@ -15,14 +15,14 @@ export TF_NUM_INTRAOP_THREADS="${TF_NUM_INTRAOP_THREADS:-4}"
 export TF_NUM_INTEROP_THREADS="${TF_NUM_INTEROP_THREADS:-2}"
 
 args=(
-    --raw-dir "$RAW_ROOT/fractal20220817_data/0.1.0"
-    --local-dir "$OUTPUT_ROOT/fractal"
+    --raw-dir "$RAW_ROOT/droid/1.0.1"
+    --local-dir "$OUTPUT_ROOT/droid"
     --use-videos
     --num-proc "$NUM_PROC"
     --image-writer-process "${IMAGE_WRITER_PROCESS:-1}"
     --image-writer-threads "${IMAGE_WRITER_THREADS:-4}"
     --prefetch-buffer "${PREFETCH_BUFFER:-2}"
-    --repo-id "${REPO_ID:-typoverflow/fractal}"
+    --repo-id "${REPO_ID:-typoverflow/droid}"
 )
 [[ "${PUSH_TO_HUB:-0}" == "1" ]] && args+=(--push-to-hub)
 

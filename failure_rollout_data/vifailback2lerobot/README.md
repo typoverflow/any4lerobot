@@ -85,7 +85,7 @@ solution (`FK(qpos[t+1]) == action_eef[t]` to ~0.1–0.4 mm on moving arms).
 
 ### Schema
 
-Raw EEF uses **quat (xyzw)**, canonical EEF **rot6d**; joints are frame-independent so their
+Raw EEF uses **quat (xyzw)**, canonical EEF **row-major rot9d**; joints are frame-independent so their
 canonical copies equal the raw ones. `side ∈ {left, right}`.
 
 | feature | dim | source |
@@ -99,10 +99,10 @@ canonical copies equal the raw ones. `side ∈ {left, right}`.
 | `raw_target.{side}_gripper_state` | 1 | `action` gripper, **raw width (m)** |
 | `raw_target.base_vel` | 2 | `base_action` (linear, angular) |
 | `state.{side}_joint_pos` / `_joint_vel` | 6 / 6 | = `raw_state` (frame-independent) |
-| `state.{side}_eef_xyz` / `_eef_rot6d` | 3 / 6 | canonical `FK(qpos)` (world → I, gripper → OpenCV) |
+| `state.{side}_eef_xyz` / `_eef_rot9d` | 3 / 9 | canonical `FK(qpos)` (world → I, gripper → OpenCV) |
 | `state.{side}_gripper_state` | 1 | `clip(width/0.095, 0, 1)`, **0 = closed, 1 = open** |
 | `target.{side}_joint_pos` | 6 | = `raw_target` |
-| `target.{side}_eef_xyz` / `_eef_rot6d` | 3 / 6 | canonical `FK(action)` |
+| `target.{side}_eef_xyz` / `_eef_rot9d` | 3 / 9 | canonical `FK(action)` |
 | `target.{side}_gripper_state` | 1 | normalized as above |
 | `target.base_vel` | 2 | `base_action` (used directly) |
 | `debug.{side}_gripper_eef_xyz` / `_eef_rot6d` | 3 / 6 | GT-next `state[t]→state[t+1]` Δ, canonical gripper frame; last step no-op |
@@ -144,7 +144,7 @@ from alignment import transforms_numpy as tn
 R_native = tn.quaternion_to_matrix(raw_state_left_eef_quat)   # xyzw
 R_align  = tn.axis_alignment_matrix("y", "-x", "z")           # R_{e'}^e, det = +1 (both arms)
 R_canon, p_canon = tn.align_axis(R_native, raw_state_left_eef_xyz, np.eye(3), R_align)
-# R_canon == rotation_6d_to_matrix(state_left_eef_rot6d), p_canon == state_left_eef_xyz
+# R_canon == state_left_eef_rot9d.reshape(-1, 3, 3), p_canon == state_left_eef_xyz
 ```
 
 ## **📜 Citation**

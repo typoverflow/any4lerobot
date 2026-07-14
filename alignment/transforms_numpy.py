@@ -19,7 +19,7 @@ Conventions
                 fixed-axis XYZ = Rz(yaw) @ Ry(pitch) @ Rx(roll) (ROS tf / scipy
                 'xyz' / pybullet / xArm). MUST match how the source made its rpy.
   quaternion  : [..., 4] scalar-LAST (x, y, z, w) -- ROS / scipy / tfg order.
-  rotation_6d : [..., 6] first two *rows* of R, flattened (Zhou et al. 2019),
+  rotation_6d : [..., 6] first two *columns* of R, concatenated (Cosmos convention),
                 recovered by Gram-Schmidt.
   frame names : R_a^b ("R_a_to_b") is the orientation of frame a expressed in b;
                 a vector converts as v^b = R_a^b v^a. Subscript e = end-effector
@@ -43,7 +43,7 @@ def _matvec(R: np.ndarray, v: np.ndarray) -> np.ndarray:
     return np.matmul(R, v[..., None])[..., 0]
 
 
-# --- rotation matrix <-> 6D (Zhou et al. 2019, "rows" convention) --------------------------------
+# --- rotation matrix <-> 6D (Cosmos first-two-columns convention) --------------------------------
 def rotation_6d_to_matrix(d6: np.ndarray) -> np.ndarray:
     """6D rotation [..., 6] -> rotation matrix [..., 3, 3] via Gram-Schmidt."""
     d6 = _f32(d6)
@@ -52,13 +52,13 @@ def rotation_6d_to_matrix(d6: np.ndarray) -> np.ndarray:
     a2_proj = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
     b2 = a2_proj / np.linalg.norm(a2_proj, axis=-1, keepdims=True)
     b3 = np.cross(b1, b2, axis=-1)
-    return np.stack((b1, b2, b3), axis=-2)
+    return np.stack((b1, b2, b3), axis=-1)
 
 
 def matrix_to_rotation_6d(matrix: np.ndarray) -> np.ndarray:
-    """Rotation matrix [..., 3, 3] -> 6D [..., 6] (first two rows)."""
+    """Rotation matrix [..., 3, 3] -> 6D [..., 6] (first two columns)."""
     matrix = _f32(matrix)
-    return np.concatenate((matrix[..., 0, :], matrix[..., 1, :]), axis=-1)
+    return np.concatenate((matrix[..., :, 0], matrix[..., :, 1]), axis=-1)
 
 
 # --- rotation matrix <-> euler (port of pytorch3d, default convention "XYZ") ----------------------

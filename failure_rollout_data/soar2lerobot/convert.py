@@ -32,11 +32,11 @@ are split, and the action is NOT stored -- it is derived at load time from state
     raw_target.eef_rpy (3)       absolute raw target = raw_state rpy + drpy (extrinsic XYZ)
     raw_target.gripper_state (1) commanded gripper, raw binary {0, 1}, 1=open (not binarized)
     state.eef_xyz (3)            canonical eef position (world align = identity), meters
-    state.eef_rot6d (6)          canonical eef rotation as rot6d (gripper -> OpenCV)
+    state.eef_rot9d (9)          canonical eef rotation as full row-major matrix (gripper -> OpenCV)
     state.gripper_state (1)      normalized [0, 1] gripper (already ~[0, 1], 1=open; kept as-is);
                                  episodes whose raw gripper is a corrupt step-counter (below) are dropped
     target.eef_xyz (3)           canonical target position (world align = identity), meters
-    target.eef_rot6d (6)         canonical target rotation as rot6d
+    target.eef_rot9d (9)         canonical target rotation as full row-major matrix
     target.gripper_state (1)     commanded gripper, {0, 1}, 1=open
     debug.gripper_eef_xyz (3)    GT-next delta in the CANONICAL gripper frame (debug only)
     debug.gripper_eef_rot6d (6)  GT-next relative rotation, canonical gripper frame;
@@ -89,7 +89,8 @@ if _REPO_ROOT not in sys.path:
 from alignment import transforms_numpy as tn  # noqa: E402
 
 IMG_SHAPE = (256, 256, 3)
-ROT6D_NAMES = ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"]
+ROT6D_NAMES = ["r11", "r21", "r31", "r12", "r22", "r32"]
+ROT9D_NAMES = [f"r{row}{col}" for row in range(1, 4) for col in range(1, 4)]
 XYZ_NAMES = ["x", "y", "z"]
 RPY_NAMES = ["roll", "pitch", "yaw"]
 _IDENTITY_ROT6D = np.array([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]], dtype=np.float32)
@@ -119,10 +120,10 @@ def build_features(use_videos: bool = True) -> dict:
         "raw_target.eef_rpy": {"dtype": "float32", "shape": (3,), "names": RPY_NAMES},
         "raw_target.gripper_state": {"dtype": "float32", "shape": (1,), "names": ["gripper"]},
         "state.eef_xyz": {"dtype": "float32", "shape": (3,), "names": XYZ_NAMES},
-        "state.eef_rot6d": {"dtype": "float32", "shape": (6,), "names": ROT6D_NAMES},
+        "state.eef_rot9d": {"dtype": "float32", "shape": (9,), "names": ROT9D_NAMES},
         "state.gripper_state": {"dtype": "float32", "shape": (1,), "names": ["gripper"]},
         "target.eef_xyz": {"dtype": "float32", "shape": (3,), "names": XYZ_NAMES},
-        "target.eef_rot6d": {"dtype": "float32", "shape": (6,), "names": ROT6D_NAMES},
+        "target.eef_rot9d": {"dtype": "float32", "shape": (9,), "names": ROT9D_NAMES},
         "target.gripper_state": {"dtype": "float32", "shape": (1,), "names": ["gripper"]},
         "debug.gripper_eef_xyz": {"dtype": "float32", "shape": (3,), "names": XYZ_NAMES},
         "debug.gripper_eef_rot6d": {"dtype": "float32", "shape": (6,), "names": ROT6D_NAMES},
@@ -185,7 +186,7 @@ def process_episode(ep, split: str) -> tuple[dict, dict, str]:
     R_t = tn.rpy_to_matrix(t_rpy, extrinsic=True)
 
     # --- canonical state and target (dataset.md sec 2.3 / 2.4): align world (already FLU ->
-    # identity) and gripper (stored widowx_envs frame -> OpenCV). rot6d is the canonical rep.
+    # identity) and gripper (stored widowx_envs frame -> OpenCV). rot9d is the canonical stored representation.
     R_c, p_c = tn.align_axis(R, xyz, np.eye(3, dtype=np.float32), R_ALIGN_WIDOWX)
     R_tc, p_tc = tn.align_axis(R_t, t_xyz, np.eye(3, dtype=np.float32), R_ALIGN_WIDOWX)
 
@@ -201,10 +202,10 @@ def process_episode(ep, split: str) -> tuple[dict, dict, str]:
         "raw_target.eef_rpy": t_rpy,
         "raw_target.gripper_state": t_grip,
         "state.eef_xyz": p_c.astype(np.float32),
-        "state.eef_rot6d": tn.matrix_to_rotation_6d(R_c).astype(np.float32),
+        "state.eef_rot9d": R_c.reshape(-1, 9).astype(np.float32),
         "state.gripper_state": grip,
         "target.eef_xyz": p_tc.astype(np.float32),
-        "target.eef_rot6d": tn.matrix_to_rotation_6d(R_tc).astype(np.float32),
+        "target.eef_rot9d": R_tc.reshape(-1, 9).astype(np.float32),
         "target.gripper_state": t_grip,
         "debug.gripper_eef_xyz": np.concatenate([p_g, np.zeros((1, 3), np.float32)]).astype(np.float32),
         "debug.gripper_eef_rot6d": np.concatenate(

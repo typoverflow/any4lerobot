@@ -49,7 +49,7 @@ target.* (canonically axis-aligned). The per-step ACTION is computed at load tim
     raw_target.gripper_state (1)  raw commanded gripper, binary {0, 1} (NOT inverted; DROID polarity)
     state.joint_pos (7)           canonical joint_pos (frame-independent, = raw_state.joint_pos)
     state.eef_xyz (3)             canonical eef translation (base already FLU -> identity)
-    state.eef_rot6d (6)           canonical eef rotation (Franka hand -> OpenCV gripper), as rot6d
+    state.eef_rot9d (9)           canonical eef rotation (Franka hand -> OpenCV gripper), full row-major matrix
     state.gripper_state (1)       1 - gripper_position (canonical: 0=closed, 1=open)
     target.joint_pos (7)          canonical joint_pos target (= raw_target.joint_pos)
     target.joint_vel (7)          canonical joint_vel target (= raw_target.joint_vel)
@@ -101,7 +101,8 @@ from alignment import transforms_numpy as tn  # noqa: E402
 
 CAMERAS = ("left", "right", "wrist")
 IMG_SHAPE = (288, 512, 3)  # (H, W, C)
-ROT6D_NAMES = ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"]
+ROT6D_NAMES = ["r11", "r21", "r31", "r12", "r22", "r32"]
+ROT9D_NAMES = [f"r{row}{col}" for row in range(1, 4) for col in range(1, 4)]
 XYZ_NAMES = ["x", "y", "z"]
 RPY_NAMES = ["roll", "pitch", "yaw"]
 JOINT_NAMES = [f"joint_{i}" for i in range(7)]
@@ -142,10 +143,10 @@ def build_features(use_videos: bool = True) -> dict:
     features["raw_target.gripper_state"] = {"dtype": "float32", "shape": (1,), "names": ["gripper"]}
     # state.*: canonical, axis-aligned (dataset.md 2.3). Joints are frame-independent (copied);
     # eef is re-based onto the canonical base (identity) + OpenCV gripper frame; gripper normalized
-    # to 0=closed / 1=open. No canonical eef_rpy -- the doc table keeps only rot6d.
+    # to 0=closed / 1=open. No canonical eef_rpy -- the canonical orientation is stored as rot9d.
     features["state.joint_pos"] = {"dtype": "float32", "shape": (7,), "names": JOINT_NAMES}
     features["state.eef_xyz"] = {"dtype": "float32", "shape": (3,), "names": XYZ_NAMES}
-    features["state.eef_rot6d"] = {"dtype": "float32", "shape": (6,), "names": ROT6D_NAMES}
+    features["state.eef_rot9d"] = {"dtype": "float32", "shape": (9,), "names": ROT9D_NAMES}
     features["state.gripper_state"] = {"dtype": "float32", "shape": (1,), "names": ["gripper"]}
     # target.*: canonical target (dataset.md 2.4). Joints frame-independent (copied from raw_target);
     # gripper inverted to canonical 0=closed / 1=open.
@@ -240,7 +241,7 @@ def process_episode(ep: "Episode") -> dict:
         # state.*: canonical, axis-aligned (dataset.md 2.3)
         "state.joint_pos": joint,  # frame-independent, copied from raw_state
         "state.eef_xyz": p_c,
-        "state.eef_rot6d": tn.matrix_to_rotation_6d(R_c).astype(np.float32),
+        "state.eef_rot9d": R_c.reshape(-1, 9).astype(np.float32),
         "state.gripper_state": (1.0 - gripper).astype(np.float32),  # canonical: 0=closed, 1=open
         # target.*: canonical target (dataset.md 2.4)
         "target.joint_pos": raw_target_joint_pos,  # frame-independent, copied from raw_target

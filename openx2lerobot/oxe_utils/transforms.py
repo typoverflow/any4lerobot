@@ -4,16 +4,10 @@ transforms.py
 
 Defines a registry of per-dataset standardization transforms for each dataset in Open-X Embodiment.
 
-Transforms adopt the following structure:
-    Input: Dictionary of *batched* features (i.e., has leading time dimension)
-    Output: Dictionary `step` =>> {
-        "observation": {
-            <image_keys, depth_image_keys>
-            State (in chosen state representation)
-        },
-        "action": Action (in chosen action representation),
-        "language_instruction": str
-    }
+Transforms consume dictionaries of *batched* RLDS features (with a leading time dimension).
+Transforms that follow ``failure_rollout_data/dataset.md`` add four named feature groups:
+``raw_state`` and ``raw_target`` preserve native values, while ``state`` and ``target`` contain
+the corresponding canonical values. Training actions are derived from these groups at load time.
 """
 
 import os
@@ -28,8 +22,8 @@ from oxe_utils.transform_utils import (
     relabel_bridge_actions,
 )
 
-# The DROID transforms below use the shared, backend-agnostic frame/rotation math from the
-# alignment package at the repo root (see design_of_state_and_action_space.md). openx runs with
+# These transforms use the shared, backend-agnostic frame/rotation math from the alignment package
+# at the repo root (see failure_rollout_data/dataset.md). openx runs with
 # CWD=openx2lerobot, so the repo root is not on sys.path by default -- add it before importing.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
@@ -38,7 +32,7 @@ if _REPO_ROOT not in sys.path:
 from alignment import transforms_tf as align_tf  # noqa: E402
 
 
-# === Canonical-frame helpers (design_of_state_and_action_space.md, "Preprocessing") ===============
+# === Canonical-frame helpers (failure_rollout_data/dataset.md, "Axis Alignment") =================
 # Every dataset standardized below runs on a robot whose BASE frame is already the canonical FLU
 # convention (x-forward, y-left, z-up), so the world alignment R_{w'}^w is the identity and positions
 # pass through unchanged. Only the GRIPPER frame is re-based onto the canonical OpenCV convention
@@ -75,46 +69,37 @@ def _to_canonical(R_native, p_native, gripper_align):
     return align_tf.align_axis(R_native, p_native, _WORLD_ALIGN_IDENTITY, gripper_align)
 
 
-def _eef_delta_fields(R_cur, p_cur, R_tgt, p_tgt, suffix=""):
-    """The six frame-aware eef delta fields for current pose e -> target e* (canonical frames).
+def _canonical_pose_fields(R_native, p_native, gripper_align):
+    """Return canonical xyz and full row-major rot9d for one native absolute pose stream."""
+    R, p = _to_canonical(R_native, p_native, gripper_align)
+    rot9d_shape = tf.concat([tf.shape(R)[:-2], [9]], axis=0)
+    return {"eef_xyz": p, "eef_rot9d": tf.reshape(R, rot9d_shape)}
 
-    ``suffix`` is ``""`` for the default ground-truth-next target, or ``"_command"`` for a commanded
-    e* (design doc: the target has two modes; commands are emitted as a parallel ``*_command`` set).
-    rpy is extrinsic XYZ throughout (the repo-wide convention).
-    """
-    world_R, world_p = align_tf.world_delta_pose(R_cur, p_cur, R_tgt, p_tgt)
-    grip_R, grip_p = align_tf.gripper_delta_pose(R_cur, p_cur, R_tgt, p_tgt)
-    diff_rpy = align_tf.matrix_to_rpy(R_tgt, extrinsic=True) - align_tf.matrix_to_rpy(R_cur, extrinsic=True)
+
+def _gt_next_debug_fields(state):
+    """Build the canonical-gripper GT-next delta, with a no-op final step."""
+    rot9d = state["eef_rot9d"]
+    matrix_shape = tf.concat([tf.shape(rot9d)[:-1], [3, 3]], axis=0)
+    R = tf.reshape(rot9d, matrix_shape)
+    p = state["eef_xyz"]
+    dR, dp = align_tf.gripper_delta_pose(R[:-1], p[:-1], R[1:], p[1:])
+    dR = tf.concat([dR, tf.eye(3, batch_shape=[1], dtype=R.dtype)], axis=0)
+    dp = tf.concat([dp, tf.zeros_like(p[-1:])], axis=0)
     return {
-        f"diff_eef_xyz{suffix}": world_p,
-        f"diff_eef_rpy{suffix}": diff_rpy,
-        f"world_eef_xyz{suffix}": world_p,
-        f"world_eef_rot6d{suffix}": align_tf.matrix_to_rotation_6d(world_R),
-        f"gripper_eef_xyz{suffix}": grip_p,
-        f"gripper_eef_rot6d{suffix}": align_tf.matrix_to_rotation_6d(grip_R),
+        "gripper_eef_xyz": dp,
+        "gripper_eef_rot6d": align_tf.matrix_to_rotation_6d(dR),
     }
 
 
-def _next_step_delta_fields(R, p):
-    """Default action over ALL T steps: the per-step motion to the next pose (obs[t] -> obs[t+1]).
-
-    The last step has no successor, so its target is the current pose repeated -- making the final
-    delta a genuine no-op (identity rotation, zero translation) while keeping every field at length T.
-
-    We build the target by repeating the last pose (``R[-1:]``/``p[-1:]``) rather than padding the
-    already-shortened delta tensor. The old ``tf.zeros_like(v[-1:])`` pad produced a *zero-length* row
-    for T==1 episodes (where the delta tensor ``v`` has length T-1 == 0), leaving xyz fields length 0
-    while rot6d fields were length 1 -- which silently dropped every single-timestep episode. The
-    repeat-last-target form is byte-for-byte identical for T>=2 and correct for T<=1.
-    """
-    R_tgt = tf.concat([R[1:], R[-1:]], axis=0)  # next pose; last repeated -> no-op final step
-    p_tgt = tf.concat([p[1:], p[-1:]], axis=0)
-    return _eef_delta_fields(R, p, R_tgt, p_tgt)
-
-
-def _diff_with_dummy_last(x):
-    """Per-step forward difference ``x[t+1] - x[t]`` over all T steps, with a zero dummy last step."""
-    return tf.concat([x[1:] - x[:-1], tf.zeros_like(x[-1:])], axis=0)
+def _set_processed_groups(trajectory, raw_state, state, raw_target=None, target=None):
+    """Attach dataset-contract groups without manufacturing a next-state target."""
+    trajectory["raw_state"] = raw_state
+    trajectory["state"] = state
+    trajectory["debug"] = _gt_next_debug_fields(state)
+    if raw_target is not None:
+        trajectory["raw_target"] = raw_target
+        trajectory["target"] = target
+    return trajectory
 
 
 def _first_nonempty_instruction(trajectory):
@@ -128,35 +113,37 @@ def _first_nonempty_instruction(trajectory):
 
 
 def droid_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    """DROID (Franka). Default e* = ground-truth next pose (last step a dummy no-op); the commanded
-    ``action_dict`` pose/joints/gripper are also emitted as ``*_command``. Native euler is extrinsic XYZ.
-    Franka hand -> canonical OpenCV gripper via ``_GRIPPER_ALIGN_FRANKA`` (= NVIDIA Cosmos ``_DROID_TO_OPENCV``).
-    """
+    """DROID: preserve native state/commands and canonicalize both absolute pose streams."""
     obs = trajectory["observation"]
     # The wrist Zed Mini is mounted below the arm, i.e. rolled 180 deg about the optical axis, so the
     # raw image x/y point opposite the canonical OpenCV gripper x/y. Rotating the image 180 deg
     # (reverse H and W; a proper rotation, not a mirror) restores image +x ~ gripper +x, +y ~ gripper +y.
     # NOTE: raw DROID wrist intrinsics (not shipped in OXE) would need cx,cy -> W-1-cx, H-1-cy.
     obs["wrist_image_left"] = obs["wrist_image_left"][:, ::-1, ::-1, :]
-    eef_xyz, joint = obs["cartesian_position"][:, :3], obs["joint_position"]
-    R, p = _to_canonical(align_tf.rpy_to_matrix(obs["cartesian_position"][:, 3:6], extrinsic=True), eef_xyz, _GRIPPER_ALIGN_FRANKA)
-    state = {
-        "eef_xyz": p,
-        "eef_rpy": align_tf.matrix_to_rpy(R, extrinsic=True),
-        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
-        "joint_pos": joint,
-        "gripper_state": invert_gripper_actions(obs["gripper_position"]),
+    cart = obs["cartesian_position"]
+    raw_state = {
+        "eef_xyz": cart[:, :3], "eef_rpy": cart[:, 3:6],
+        "joint_pos": obs["joint_position"], "gripper_state": obs["gripper_position"],
     }
-    action = _next_step_delta_fields(R, p)
-    action["diff_joint_pos"] = _diff_with_dummy_last(joint)
-    # commanded absolute pose (xyz + extrinsic-XYZ euler) / joints / gripper, aligned the same way
+    state = _canonical_pose_fields(
+        align_tf.rpy_to_matrix(raw_state["eef_rpy"], extrinsic=True),
+        raw_state["eef_xyz"], _GRIPPER_ALIGN_FRANKA,
+    )
+    state.update(joint_pos=raw_state["joint_pos"],
+                 gripper_state=invert_gripper_actions(raw_state["gripper_state"]))
     act = trajectory["action_dict"]
     cmd = act["cartesian_position"]
-    R_cmd, p_cmd = _to_canonical(align_tf.rpy_to_matrix(cmd[:, 3:6], extrinsic=True), cmd[:, :3], _GRIPPER_ALIGN_FRANKA)
-    action.update(_eef_delta_fields(R, p, R_cmd, p_cmd, suffix="_command"))
-    action["diff_joint_pos_command"] = act["joint_position"] - joint
-    action["gripper_state"] = invert_gripper_actions(act["gripper_position"])
-    trajectory["state"], trajectory["action"] = state, action
+    raw_target = {
+        "eef_xyz": cmd[:, :3], "eef_rpy": cmd[:, 3:6],
+        "joint_pos": act["joint_position"], "gripper_state": act["gripper_position"],
+    }
+    target = _canonical_pose_fields(
+        align_tf.rpy_to_matrix(raw_target["eef_rpy"], extrinsic=True),
+        raw_target["eef_xyz"], _GRIPPER_ALIGN_FRANKA,
+    )
+    target.update(joint_pos=raw_target["joint_pos"],
+                  gripper_state=invert_gripper_actions(raw_target["gripper_state"]))
+    _set_processed_groups(trajectory, raw_state, state, raw_target, target)
     trajectory["language_instruction"] = _first_nonempty_instruction(trajectory)
     return trajectory
 
@@ -192,24 +179,20 @@ def bridge_oxe_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def bridge_orig_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    """BridgeData V2 (WidowX). state [7] = eef xyz + extrinsic-XYZ rpy + gripper (1=open); no extrinsics.
-    Default e* = ground-truth next pose (last step a dummy no-op); NO ``*_command`` (the raw action is the
-    unreliable one the repo relabels to the state delta). Stored widowx_envs gripper frame ->
-    canonical OpenCV gripper via ``_GRIPPER_ALIGN_WIDOWX``.
-    """
+    """BridgeData V2: canonicalize state; retain only the meaningful commanded gripper target."""
     obs = trajectory["observation"]
-    eef_xyz = obs["state"][:, :3]
-    R, p = _to_canonical(align_tf.rpy_to_matrix(obs["state"][:, 3:6], extrinsic=True), eef_xyz, _GRIPPER_ALIGN_WIDOWX)
-    state = {
-        "eef_xyz": p,
-        "eef_rpy": align_tf.matrix_to_rpy(R, extrinsic=True),
-        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
-        "gripper_state": obs["state"][:, 6:7],
-    }
-    action = _next_step_delta_fields(R, p)
-    # commanded gripper, binarized; already 1=open / 0=closed (no inversion)
-    action["gripper_state"] = binarize_gripper_actions(trajectory["action"][:, 6])[:, None]
-    trajectory["state"], trajectory["action"] = state, action
+    raw = obs["state"]
+    raw_state = {"eef_xyz": raw[:, :3], "eef_rpy": raw[:, 3:6],
+                 "gripper_state": raw[:, 6:7]}
+    state = _canonical_pose_fields(
+        align_tf.rpy_to_matrix(raw_state["eef_rpy"], extrinsic=True),
+        raw_state["eef_xyz"], _GRIPPER_ALIGN_WIDOWX,
+    )
+    state["gripper_state"] = raw_state["gripper_state"]
+    # The pose action is a relabeled finite difference, not a controller target. The gripper is real.
+    raw_target = {"gripper_state": trajectory["action"][:, 6:7]}
+    target = {"gripper_state": binarize_gripper_actions(raw_target["gripper_state"][:, 0])[:, None]}
+    _set_processed_groups(trajectory, raw_state, state, raw_target, target)
     # language passes through unchanged from BridgeData V2's step-level top-level instruction (length T)
     trajectory["language_instruction"] = trajectory["language_instruction"]
     return trajectory
@@ -229,30 +212,26 @@ def ppgm_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def rt1_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    """RT-1 / fractal (Google Robot, no joints, no extrinsics). ``base_pose_tool_reached`` = xyz + quat
-    (xyzw). Default e* = ground-truth next pose (last step a dummy no-op); the base-frame command
-    ``world_vector`` + ``rotation_delta`` is emitted as ``*_command``. Tool approach axis is already
-    canonical +z and the finger axis is undocumented, so ``_GRIPPER_ALIGN_GOOGLE`` is identity.
-    """
+    """RT-1/fractal: compose base-frame deltas into absolute native and canonical targets."""
     obs = trajectory["observation"]
-    eef_xyz = obs["base_pose_tool_reached"][:, :3]
-    R_native = align_tf.quaternion_to_matrix(obs["base_pose_tool_reached"][:, 3:7])  # (x, y, z, w)
-    R, p = _to_canonical(R_native, eef_xyz, _GRIPPER_ALIGN_GOOGLE)
-    state = {
-        "eef_xyz": p,
-        "eef_rpy": align_tf.matrix_to_rpy(R, extrinsic=True),
-        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
-        "gripper_state": invert_gripper_actions(obs["gripper_closed"]),
-    }
-    action = _next_step_delta_fields(R, p)
-    # command e*: p + world_vector ; R = dR_world @ R (world-frame delta, left-multiply)
+    pose = obs["base_pose_tool_reached"]
+    raw_state = {"eef_xyz": pose[:, :3], "eef_quat": pose[:, 3:7],
+                 "gripper_state": obs["gripper_closed"]}
+    R_native = align_tf.quaternion_to_matrix(raw_state["eef_quat"])
+    state = _canonical_pose_fields(R_native, raw_state["eef_xyz"], _GRIPPER_ALIGN_GOOGLE)
+    state["gripper_state"] = invert_gripper_actions(raw_state["gripper_state"])
     act = trajectory["action"]
     dR_world = align_tf.rpy_to_matrix(act["rotation_delta"], extrinsic=True)
-    R_cmd, p_cmd = _to_canonical(tf.matmul(dR_world, R_native), eef_xyz + act["world_vector"], _GRIPPER_ALIGN_GOOGLE)
-    action.update(_eef_delta_fields(R, p, R_cmd, p_cmd, suffix="_command"))
-    # gripper: relative closedness command -> absolute (0=closed, 1=open)
-    action["gripper_state"] = rel2abs_gripper_actions(act["gripper_closedness_action"][:, 0])[:, None]
-    trajectory["state"], trajectory["action"] = state, action
+    R_target_native = tf.matmul(dR_world, R_native)
+    target_open = rel2abs_gripper_actions(act["gripper_closedness_action"][:, 0])[:, None]
+    raw_target = {
+        "eef_xyz": raw_state["eef_xyz"] + act["world_vector"],
+        "eef_quat": align_tf.matrix_to_quaternion(R_target_native),
+        "gripper_state": invert_gripper_actions(target_open),
+    }
+    target = _canonical_pose_fields(R_target_native, raw_target["eef_xyz"], _GRIPPER_ALIGN_GOOGLE)
+    target["gripper_state"] = target_open
+    _set_processed_groups(trajectory, raw_state, state, raw_target, target)
     trajectory["language_instruction"] = obs["natural_language_instruction"]
     return trajectory
 
@@ -275,32 +254,28 @@ def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def taco_play_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    """CALVIN / taco_play (Franka). ``robot_obs`` [15] = eef xyz (0:3) + extrinsic-XYZ rpy (3:6) +
-    gripper width (6) + joints (7:14) + gripper action (14); pybullet poses, no extrinsics. Default e*
-    = ground-truth next pose (last step a dummy no-op); the absolute-pose command ``action.actions`` [0:6]
-    is emitted as ``*_command`` (CALVIN's scaled ``rel_actions_*`` are not used). Franka hand -> canonical
-    OpenCV gripper via ``_GRIPPER_ALIGN_FRANKA``.
-    """
+    """CALVIN/taco_play: preserve the absolute pose command and normalize Panda width to [0, 1]."""
     obs = trajectory["observation"]
     robot_obs = obs["robot_obs"]
-    eef_xyz, joint = robot_obs[:, 0:3], robot_obs[:, 7:14]
-    R, p = _to_canonical(align_tf.rpy_to_matrix(robot_obs[:, 3:6], extrinsic=True), eef_xyz, _GRIPPER_ALIGN_FRANKA)
-    state = {
-        "eef_xyz": p,
-        "eef_rpy": align_tf.matrix_to_rpy(R, extrinsic=True),
-        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
-        "joint_pos": joint,
-        "gripper_state": robot_obs[:, 6:7],  # sensed gripper width; larger = more open
+    raw_state = {
+        "eef_xyz": robot_obs[:, 0:3], "eef_rpy": robot_obs[:, 3:6],
+        "gripper_state": robot_obs[:, 6:7], "joint_pos": robot_obs[:, 7:14],
     }
-    action = _next_step_delta_fields(R, p)
-    action["diff_joint_pos"] = _diff_with_dummy_last(joint)
-    # commanded absolute target pose: actions[:, 0:3] xyz, actions[:, 3:6] extrinsic-XYZ rpy
+    state = _canonical_pose_fields(
+        align_tf.rpy_to_matrix(raw_state["eef_rpy"], extrinsic=True),
+        raw_state["eef_xyz"], _GRIPPER_ALIGN_FRANKA,
+    )
+    state.update(joint_pos=raw_state["joint_pos"],
+                 gripper_state=tf.clip_by_value(raw_state["gripper_state"] / 0.08, 0.0, 1.0))
     cmd = trajectory["action"]["actions"]
-    R_cmd, p_cmd = _to_canonical(align_tf.rpy_to_matrix(cmd[:, 3:6], extrinsic=True), cmd[:, 0:3], _GRIPPER_ALIGN_FRANKA)
-    action.update(_eef_delta_fields(R, p, R_cmd, p_cmd, suffix="_command"))
-    # commanded gripper (absolute), 1=open / -1=closed -> clip to 1=open / 0=closed
-    action["gripper_state"] = tf.clip_by_value(cmd[:, 6:7], 0.0, 1.0)
-    trajectory["state"], trajectory["action"] = state, action
+    raw_target = {"eef_xyz": cmd[:, 0:3], "eef_rpy": cmd[:, 3:6],
+                  "gripper_state": cmd[:, 6:7]}
+    target = _canonical_pose_fields(
+        align_tf.rpy_to_matrix(raw_target["eef_rpy"], extrinsic=True),
+        raw_target["eef_xyz"], _GRIPPER_ALIGN_FRANKA,
+    )
+    target["gripper_state"] = tf.clip_by_value(raw_target["gripper_state"], 0.0, 1.0)
+    _set_processed_groups(trajectory, raw_state, state, raw_target, target)
     trajectory["language_instruction"] = obs["natural_language_instruction"]
     return trajectory
 
@@ -646,33 +621,30 @@ def austin_sirius_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any
 
 
 def bc_z_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
-    """BC-Z (Google Robot, no joints, no extrinsics). ``present/xyz`` + ``present/axis_angle`` (rotation
-    vector) in the base frame. Default e* = ground-truth next pose (last step a dummy no-op). The
-    ``future/{xyz,axis_angle}_residual`` command is FAR-HORIZON (~5-7 steps, ~9x per-step), emitted as
-    ``*_command`` (a multi-step target, not a 1-step command). Tool approach is already canonical +z and
-    the finger axis is undocumented, so ``_GRIPPER_ALIGN_GOOGLE`` is identity.
-    """
+    """BC-Z: compose the far-horizon base-frame residual into an absolute target pose."""
     obs = trajectory["observation"]
-    eef_xyz = obs["present/xyz"]
-    R_native = align_tf.axis_angle_to_matrix(obs["present/axis_angle"])
-    R, p = _to_canonical(R_native, eef_xyz, _GRIPPER_ALIGN_GOOGLE)
-    state = {
-        "eef_xyz": p,
-        "eef_rpy": align_tf.matrix_to_rpy(R, extrinsic=True),
-        "eef_rot6d": align_tf.matrix_to_rotation_6d(R),
-        # present/sensed_close is continuous in [~0.2, 1] with 1 = fully closed -> invert to 1=open
-        "gripper_state": invert_gripper_actions(obs["present/sensed_close"]),
+    raw_state = {
+        "eef_xyz": obs["present/xyz"], "eef_axis_angle": obs["present/axis_angle"],
+        "gripper_state": obs["present/sensed_close"],
     }
-    action = _next_step_delta_fields(R, p)
-    # far-horizon command: present + first future residual (xyz = base-frame translation; axis_angle =
-    # base-frame delta rotation, left-multiplied onto R)
+    R_native = align_tf.axis_angle_to_matrix(raw_state["eef_axis_angle"])
+    state = _canonical_pose_fields(R_native, raw_state["eef_xyz"], _GRIPPER_ALIGN_GOOGLE)
+    # sensed_close spans approximately 0.2 (open) to 1.0 (closed); map those physical endpoints.
+    state["gripper_state"] = tf.clip_by_value(
+        invert_gripper_actions(raw_state["gripper_state"]) / 0.8, 0.0, 1.0
+    )
     fut = trajectory["action"]
-    R_cmd_native = tf.matmul(align_tf.axis_angle_to_matrix(fut["future/axis_angle_residual"][:, :3]), R_native)
-    R_cmd, p_cmd = _to_canonical(R_cmd_native, eef_xyz + fut["future/xyz_residual"][:, :3], _GRIPPER_ALIGN_GOOGLE)
-    action.update(_eef_delta_fields(R, p, R_cmd, p_cmd, suffix="_command"))
-    # commanded immediate gripper, binary {0,1} with 1=closed -> invert to 1=open
-    action["gripper_state"] = invert_gripper_actions(tf.cast(fut["future/target_close"][:, :1], tf.float32))
-    trajectory["state"], trajectory["action"] = state, action
+    R_target_native = tf.matmul(
+        align_tf.axis_angle_to_matrix(fut["future/axis_angle_residual"][:, :3]), R_native
+    )
+    raw_target = {
+        "eef_xyz": raw_state["eef_xyz"] + fut["future/xyz_residual"][:, :3],
+        "eef_axis_angle": align_tf.matrix_to_axis_angle(R_target_native),
+        "gripper_state": tf.cast(fut["future/target_close"][:, :1], tf.float32),
+    }
+    target = _canonical_pose_fields(R_target_native, raw_target["eef_xyz"], _GRIPPER_ALIGN_GOOGLE)
+    target["gripper_state"] = invert_gripper_actions(raw_target["gripper_state"])
+    _set_processed_groups(trajectory, raw_state, state, raw_target, target)
     trajectory["language_instruction"] = obs["natural_language_instruction"]
     return trajectory
 

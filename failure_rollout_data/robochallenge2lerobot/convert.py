@@ -31,7 +31,7 @@ and canonically axis-aligned ``state.*``. Single-arm shown; dual-arm mirrors wit
     raw_state.gripper_state (1)   raw gripper width (m)
     state.joint_pos (6)           = raw_state.joint_pos (joints are frame-independent)
     state.eef_xyz (3)             canonical FK EEF translation (world -> I)
-    state.eef_rot6d (6)           canonical FK EEF orientation (gripper -> OpenCV per robot), rot6d
+    state.eef_rot9d (9)           canonical FK EEF orientation (gripper -> OpenCV per robot), full row-major matrix
     state.gripper_state (1)       gripper width / per-robot max, clip [0,1], 0=closed 1=open
     debug.gripper_eef_xyz (3)     GT-next delta translation in the canonical gripper frame (last step no-op)
     debug.gripper_eef_rot6d(6)    GT-next delta rotation in the canonical gripper frame (last step identity)
@@ -73,7 +73,8 @@ from rc_fk import SerialChainFK  # noqa: E402
 
 IMG_SHAPE = (480, 640, 3)  # default; per-robot override via ROBOTS[...]["img_shape"] (e.g. UR5)
 XYZ = ["x", "y", "z"]
-ROT6D = ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"]
+ROT6D = ["r11", "r21", "r31", "r12", "r22", "r32"]
+ROT9D = [f"r{row}{col}" for row in range(1, 4) for col in range(1, 4)]
 JOINTS = [f"joint_{i}" for i in range(1, 7)]
 _IDENTITY_ROT6D = np.array([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]], dtype=np.float32)
 
@@ -93,7 +94,7 @@ CAMS_DUAL = {"/videos_front": "cam_high", "/videos_left": "cam_left_wrist", "/vi
 #   UR5    = None            -- native frame confirmed correct by reviewer
 #   ARX5   = ("z","-x","-y") -- confirmed from action viz (native x=approach,y=left,z=up -> OpenCV)
 #   DOS-W1 = None            -- UNVERIFIED placeholder (reviewer could not judge from video)
-# For the unverified DOS-W1, state.eef_rot6d == raw_state.eef_rot6d until a relabel is set. The
+# For the unverified DOS-W1, the canonical and raw rotations represent the same matrix until a relabel is set. The
 # optical-flow probe in infer_gripper_axes.py failed its PiPER validation (1/3 axes, R^2<=0.12),
 # so nothing is baked in for them. See README "Conversion status".
 ROBOTS = {
@@ -157,7 +158,7 @@ def build_features(cfg: dict, use_videos: bool = True) -> dict:
         # state.* -- canonically axis-aligned (world -> I, gripper -> OpenCV per robot).
         features[f"state.{pre}joint_pos"] = {"dtype": "float32", "shape": (6,), "names": JOINTS}
         features[f"state.{pre}eef_xyz"] = {"dtype": "float32", "shape": (3,), "names": XYZ}
-        features[f"state.{pre}eef_rot6d"] = {"dtype": "float32", "shape": (6,), "names": ROT6D}
+        features[f"state.{pre}eef_rot9d"] = {"dtype": "float32", "shape": (9,), "names": ROT9D}
         features[f"state.{pre}gripper_state"] = {"dtype": "float32", "shape": (1,), "names": ["gripper"]}
     for s in sides:
         pre = f"{s}_" if s else ""
@@ -247,7 +248,7 @@ def _arm_state(arm, grid, cfg, fk, fps, cutoff_hz, order, smooth, gripper_align)
         "raw_gripper_state": width,
         "joint_pos": sm_joints,  # smoothed (state.* is the smoothed record)
         "eef_xyz": p_c.astype(np.float32),
-        "eef_rot6d": tn.matrix_to_rotation_6d(R_c).astype(np.float32),
+        "eef_rot9d": R_c.reshape(-1, 9).astype(np.float32),
         "gripper_state": grip_norm,
         "debug_gripper_eef_xyz": dbg_xyz,
         "debug_gripper_eef_rot6d": dbg_rot,
@@ -284,7 +285,7 @@ def process_rollout(job: dict, cfg: dict, fps: int, fk, cutoff_hz: float, order:
         state_data[f"raw_state.{pre}gripper_state"] = arm["raw_gripper_state"]
         state_data[f"state.{pre}joint_pos"] = arm["joint_pos"]
         state_data[f"state.{pre}eef_xyz"] = arm["eef_xyz"]
-        state_data[f"state.{pre}eef_rot6d"] = arm["eef_rot6d"]
+        state_data[f"state.{pre}eef_rot9d"] = arm["eef_rot9d"]
         state_data[f"state.{pre}gripper_state"] = arm["gripper_state"]
         state_data[f"debug.{pre}gripper_eef_xyz"] = arm["debug_gripper_eef_xyz"]
         state_data[f"debug.{pre}gripper_eef_rot6d"] = arm["debug_gripper_eef_rot6d"]

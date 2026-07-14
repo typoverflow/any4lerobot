@@ -51,7 +51,7 @@ $$
 
 Joint angles are frame-independent and are left unchanged.
 
-> **Handedness guard.** rot6d and any $SO(3)$ delta cannot encode a reflection. If aligning
+> **Handedness guard.** Stored orientation matrices and $SO(3)$ deltas must remain proper rotations, not reflections. If aligning
 > the axes ever forces $\det = -1$, the target canonical frame was defined left-handed and
 > must be redefined. Always verify $\det R_{w'}^w = \det R_{e'}^e = +1$.
 
@@ -105,16 +105,22 @@ For joint velocity control, `raw_target.joint_vel` will be the absolute desired 
 
 ### 2.3 `state.*`
 We apply a series of transformations and alignments to the original dataset to get the canonical states:
-1. Compute the EEF orientation as a rotation matrix $R_t$ and store it in **6D representation**: rot6d is the flattened first two rows of $R_t$, $\mathrm{rot6d}(R_t) = [\ R_{11}, R_{12}, R_{13},\; R_{21}, R_{22}, R_{23}\ ] \in \mathbb{R}^6$. The third row (and thus the full matrix) is recovered by Gram–Schmidt at load time.
+1. Compute the EEF orientation as a rotation matrix $R_t$ and store the **full matrix** in row-major 9D representation: $\mathrm{rot9d}(R_t) = [\ R_{11}, R_{12}, R_{13},\; R_{21}, R_{22}, R_{23},\; R_{31}, R_{32}, R_{33}\ ] \in \mathbb{R}^9$. No orientation information is discarded and no reconstruction is needed at load time.
 2. Apply axis alignment to map the pose into the canonical base and EEF frames (see [Axis Alignment](#12-axis-alignment)).
 3. Normalize the gripper state to $[0, 1]$ by dividing by its maximum value, where 0 is fully closed and 1 is fully open. If the raw gripper state is binary, keep the binary and verify the sign convention.
+
+When rot6d is used for a raw field, derived action, or model interface, it follows the
+**Cosmos column convention**: concatenate the first two columns of $R$,
+$\mathrm{rot6d}(R) = [\ R_{11}, R_{21}, R_{31},\; R_{12}, R_{22}, R_{32}\ ]$.
+During decoding, Gram–Schmidt orthonormalizes these two column vectors and their cross
+product supplies the third column.
 
 | entry name            | meaning                                                                                 |
 | :-------------------- | :-------------------------------------------------------------------------------------- |
 | `state.joint_pos`     | joint position (in rad); frame-independent, copied from `raw_state`                     |
 | `state.joint_vel`     | joint velocity; frame-independent, copied from `raw_state`                              |
 | `state.eef_xyz`       | canonical translation $p_t$ of the EEF in the canonical base frame                      |
-| `state.eef_rot6d`     | canonical EEF rotation $R_t$ (canonical EEF frame in canonical base frame), as rot6d    |
+| `state.eef_rot9d`     | canonical EEF rotation $R_t$ (canonical EEF frame in canonical base frame), as the full row-major $3\times3$ matrix    |
 | `state.gripper_state` | gripper state normalized to $[0, 1]$ (0 = fully closed, 1 = fully open), or kept binary |
 
 ### 2.4 `target.*`

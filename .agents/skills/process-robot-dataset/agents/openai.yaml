@@ -1,0 +1,4 @@
+interface:
+  display_name: "Process Robot Dataset"
+  short_description: "Convert raw robot data into canonical datasets"
+  default_prompt: "Use $process-robot-dataset to convert this raw robot dataset into the canonical state and target schema."

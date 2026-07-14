@@ -48,10 +48,10 @@ command, so both `raw_target.*` and `target.*` are present.
 | `raw_target.eef_rpy` | (3,) | absolute raw target = `raw_state.eef_rpy + Δrpy` (extrinsic XYZ) |
 | `raw_target.gripper_state` | (1,) | commanded gripper, **binary {0, 1}**, 1=open |
 | `state.eef_xyz` | (3,) | **canonical** eef position (world align = identity ⇒ == raw), **meters** |
-| `state.eef_rot6d` | (6,) | **canonical** eef rotation as Zhou-6D (gripper → OpenCV) |
+| `state.eef_rot9d` | (9,) | **canonical** eef rotation as the full row-major matrix (gripper → OpenCV) |
 | `state.gripper_state` | (1,) | gripper normalized to [0, 1] (already ~[0, 1], 1=open; kept as-is) |
 | `target.eef_xyz` | (3,) | **canonical** target position (world align = identity), **meters** |
-| `target.eef_rot6d` | (6,) | **canonical** target rotation as Zhou-6D |
+| `target.eef_rot9d` | (9,) | **canonical** target rotation as the full row-major matrix |
 | `target.gripper_state` | (1,) | commanded gripper, {0, 1}, 1=open |
 | `debug.gripper_eef_xyz` | (3,) | GT-next delta in the **canonical gripper frame** (debug only, below) |
 | `debug.gripper_eef_rot6d` | (6,) | GT-next relative rotation, canonical gripper frame (debug only) |
@@ -131,18 +131,18 @@ from alignment import transforms_numpy as tn   # repo-root package
 
 R_ALIGN_WIDOWX = tn.axis_alignment_matrix("-y", "-x", "-z")   # stored gripper -> OpenCV
 
-# native rpy (extrinsic XYZ) -> canonical rot6d, as stored in state.eef_rot6d:
+# native rpy (extrinsic XYZ) -> canonical row-major rot9d, as stored in state.eef_rot9d:
 R_native = tn.rpy_to_matrix(raw_state_eef_rpy, extrinsic=True)
 R_canon, p_canon = tn.align_axis(R_native, raw_state_eef_xyz, np.eye(3), R_ALIGN_WIDOWX)
 # world align = identity => p_canon == the raw xyz; only orientations are re-based.
-# state.eef_rot6d = tn.matrix_to_rotation_6d(R_canon);  reload with tn.rotation_6d_to_matrix.
+# state.eef_rot9d = R_canon.reshape(-1, 9); reload with state_eef_rot9d.reshape(-1, 3, 3).
 ```
 
 ### `debug.*` fields
 
 `debug.gripper_eef_xyz` / `debug.gripper_eef_rot6d` precompute the **GT-next** EEF-pose action
 (`dataset.md` §3) directly from the stored `state.*`: the canonical poses `(R_c, p_c)` at `t`
-and `t+1` (i.e. `state.eef_rot6d`/`state.eef_xyz` at consecutive steps) expressed as the
+and `t+1` (i.e. `state.eef_rot9d`/`state.eef_xyz` at consecutive steps) expressed as the
 gripper-frame delta
 `R_g = R_c[t]ᵀ R_c[t+1]`, `p_g = R_c[t]ᵀ (p_c[t+1] − p_c[t])`
 (`tn.gripper_delta_pose`). This is the load-time action when the **next state** is used as the

@@ -51,7 +51,7 @@ the raw ones.
 | `raw_target.gripper_state` | (1) | **raw commanded** gripper, binary `{0, 1}` (see gripper note) |
 | `state.joint_pos` | (7) | canonical joint position (= `raw_state.joint_pos`) |
 | `state.eef_xyz` | (3) | canonical eef translation (base already FLU → identity) |
-| `state.eef_rot6d` | (6) | canonical eef rotation (Franka hand → OpenCV gripper), as rot6d |
+| `state.eef_rot9d` | (9) | canonical eef rotation (Franka hand → OpenCV gripper), full row-major matrix |
 | `state.gripper_state` | (1) | `1 − gripper_position`, canonical **0 = closed, 1 = open** |
 | `target.joint_pos` | (7) | canonical joint-position target (= `raw_target.joint_pos`) |
 | `target.joint_vel` | (7) | canonical joint-velocity target (= `raw_target.joint_vel`) |
@@ -110,14 +110,14 @@ The DROID base frame is already the canonical world frame (Forward-Left-Up), so 
 re-based: the Franka `panda_hand` EEF frame is mapped onto the canonical OpenCV gripper frame
 (z = approach, x = finger-open "right", y = down) via the constant rotation
 `R_{e'}^e = axis_alignment_matrix("-y", "x", "z")` (identical to openx2lerobot's `_GRIPPER_ALIGN_FRANKA`).
-`state.eef_{xyz,rot6d}` are the canonical pose; to reproduce the alignment from `raw_state`:
+`state.eef_{xyz,rot9d}` are the canonical pose; to reproduce the alignment from `raw_state`:
 
 ```python
 from alignment import transforms_numpy as tn
 R = tn.rpy_to_matrix(raw_state_eef_rpy, extrinsic=True)      # DROID rpy is extrinsic XYZ
 R_align = tn.axis_alignment_matrix("-y", "x", "z")           # Franka EEF -> canonical OpenCV gripper
 R_canon, p_canon = tn.align_axis(R, raw_state_eef_xyz, np.eye(3), R_align)
-# R_canon == rotation_6d_to_matrix(state_eef_rot6d), p_canon == state_eef_xyz
+# R_canon == state_eef_rot9d.reshape(-1, 3, 3), p_canon == state_eef_xyz
 ```
 
 The `debug.gripper_eef_{xyz,rot6d}` fields hold the ground-truth next-step relative motion

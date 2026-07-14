@@ -42,11 +42,11 @@ stored -- it is derived at load time from state.*/target.* (dataset.md sec 3). D
     state.{side}_joint_pos (6)         qpos joints (frame-independent, copied)
     state.{side}_joint_vel (6)         qvel joints (frame-independent, copied)
     state.{side}_eef_xyz (3)           canonical FK(qpos) translation (world align = identity)
-    state.{side}_eef_rot6d (6)         canonical FK(qpos) rotation (gripper -> OpenCV), rot6d
+    state.{side}_eef_rot9d (9)         canonical FK(qpos) rotation (gripper -> OpenCV), full row-major matrix
     state.{side}_gripper_state (1)     gripper_width / GRIPPER_MAX, clipped [0, 1], 1=open
     target.{side}_joint_pos (6)        `action` target joints (frame-independent, copied)
     target.{side}_eef_xyz (3)          canonical FK(action) translation (world align = identity)
-    target.{side}_eef_rot6d (6)        canonical FK(action) rotation (gripper -> OpenCV), rot6d
+    target.{side}_eef_rot9d (9)        canonical FK(action) rotation (gripper -> OpenCV), full row-major matrix
     target.{side}_gripper_state (1)    `action` gripper_width / GRIPPER_MAX, clipped [0, 1], 1=open
     target.base_vel (2)                base_action, copied (velocity control -> used directly)
     debug.{side}_gripper_eef_xyz (3)   DEBUG ONLY: state(t)->state(t+1) translation in the
@@ -229,7 +229,8 @@ class PiperFK:
 # Features / episode loading
 # --------------------------------------------------------------------------------------
 JOINT_NAMES = [f"joint_{i}" for i in range(6)]
-ROT6D_NAMES = ["rot1", "rot2", "rot3", "rot4", "rot5", "rot6"]
+ROT6D_NAMES = ["r11", "r21", "r31", "r12", "r22", "r32"]
+ROT9D_NAMES = [f"r{row}{col}" for row in range(1, 4) for col in range(1, 4)]
 XYZ_NAMES = ["x", "y", "z"]
 QUAT_NAMES = ["x", "y", "z", "w"]  # scalar-last (xyzw), the rep ViFailback ships (action_eef)
 BASE_VEL_NAMES = ["linear_vel", "angular_vel"]
@@ -277,13 +278,13 @@ def build_features(use_videos: bool = True, save_depth: bool = False) -> dict:
         features[f"state.{side}_joint_pos"] = {"dtype": "float32", "shape": (6,), "names": JOINT_NAMES}
         features[f"state.{side}_joint_vel"] = {"dtype": "float32", "shape": (6,), "names": JOINT_NAMES}
         features[f"state.{side}_eef_xyz"] = {"dtype": "float32", "shape": (3,), "names": XYZ_NAMES}
-        features[f"state.{side}_eef_rot6d"] = {"dtype": "float32", "shape": (6,), "names": ROT6D_NAMES}
+        features[f"state.{side}_eef_rot9d"] = {"dtype": "float32", "shape": (9,), "names": ROT9D_NAMES}
         features[f"state.{side}_gripper_state"] = {"dtype": "float32", "shape": (1,), "names": ["gripper"]}
     # target.*: canonical target (dataset.md 2.4). Joints frame-independent (copied from raw_target).
     for side in SIDES:
         features[f"target.{side}_joint_pos"] = {"dtype": "float32", "shape": (6,), "names": JOINT_NAMES}
         features[f"target.{side}_eef_xyz"] = {"dtype": "float32", "shape": (3,), "names": XYZ_NAMES}
-        features[f"target.{side}_eef_rot6d"] = {"dtype": "float32", "shape": (6,), "names": ROT6D_NAMES}
+        features[f"target.{side}_eef_rot9d"] = {"dtype": "float32", "shape": (9,), "names": ROT9D_NAMES}
         features[f"target.{side}_gripper_state"] = {"dtype": "float32", "shape": (1,), "names": ["gripper"]}
     features["target.base_vel"] = {"dtype": "float32", "shape": (2,), "names": BASE_VEL_NAMES}
     for side in SIDES:
@@ -400,12 +401,12 @@ def load_episode(path: Path, fk: PiperFK, save_depth: bool = False) -> tuple[dic
         data[f"state.{side}_joint_pos"] = joints  # frame-independent, copied
         data[f"state.{side}_joint_vel"] = joint_vel
         data[f"state.{side}_eef_xyz"] = p_state_c.astype(np.float32)
-        data[f"state.{side}_eef_rot6d"] = tn.matrix_to_rotation_6d(R_state_c).astype(np.float32)
+        data[f"state.{side}_eef_rot9d"] = R_state_c.reshape(-1, 9).astype(np.float32)
         data[f"state.{side}_gripper_state"] = normalize_gripper(grip)[:, None]
         # target.* (canonical)
         data[f"target.{side}_joint_pos"] = act_joints  # frame-independent, copied
         data[f"target.{side}_eef_xyz"] = p_tgt_c.astype(np.float32)
-        data[f"target.{side}_eef_rot6d"] = tn.matrix_to_rotation_6d(R_tgt_c).astype(np.float32)
+        data[f"target.{side}_eef_rot9d"] = R_tgt_c.reshape(-1, 9).astype(np.float32)
         data[f"target.{side}_gripper_state"] = normalize_gripper(act_grip)[:, None]
 
         # DEBUG ONLY: relative pose from GT state t to GT state t+1, expressed in the canonical
